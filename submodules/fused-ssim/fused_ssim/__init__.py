@@ -1,7 +1,14 @@
 from typing import NamedTuple
 import torch.nn as nn
 import torch
-from fused_ssim_cuda import fusedssim, fusedssim_backward
+
+if torch.cuda.is_available():
+    from fused_ssim_cuda import fusedssim, fusedssim_backward
+elif torch.mps.is_available():
+    from fused_ssim_mps import fusedssim, fusedssim_backward
+elif hasattr(torch, 'xpu') and torch.xpu.is_available():
+    from fused_ssim_xpu import fusedssim, fusedssim_backward
+
 
 allowed_padding = ["same", "valid"]
 
@@ -37,5 +44,6 @@ def fused_ssim(img1, img2, padding="same", train=True):
 
     assert padding in allowed_padding
 
+    img1 = img1.contiguous()
     map = FusedSSIMMap.apply(C1, C2, img1, img2, padding, train)
     return map.mean()
