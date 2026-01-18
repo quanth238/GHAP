@@ -101,9 +101,9 @@ def _backproject(view, u, v, depth) -> torch.Tensor:
     y = (v - cy) / fy * depth
     z = depth
     points_cam = torch.stack([x, y, z], dim=1)
-    # world_view_transform is stored as row-vector matrix (w2c^T). For row-vector
-    # points, camera->world is the inverse without an extra transpose.
-    view_to_world = view.world_view_transform.inverse()
+    # world_view_transform is stored as W2C^T for the CUDA rasterizer (column-major).
+    # For row-vector math in Python, use C2W = (W2C^T)^-T.
+    view_to_world = view.world_view_transform.inverse().transpose(0, 1)
     points_world = geom_transform_points(points_cam, view_to_world)
     return points_world
 
@@ -202,7 +202,9 @@ def _debug_reprojection(view, debug_np: Dict[str, np.ndarray]) -> None:
     depth = torch.from_numpy(debug_np["depth"]).float().cuda()
     pts_world = _backproject(view, u, v, depth)
 
-    pts_view = geom_transform_points(pts_world, view.world_view_transform)
+    # Use row-major W2C for reprojection.
+    world_to_view = view.world_view_transform.transpose(0, 1)
+    pts_view = geom_transform_points(pts_world, world_to_view)
     z = pts_view[:, 2]
     fx = fov2focal(view.FoVx, view.image_width)
     fy = fov2focal(view.FoVy, view.image_height)
