@@ -221,43 +221,45 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         new_params, timings = build_student_from_rss_voxel(
                             gaussians, scene, dataset, pipe, cfg, SPARSE_ADAM_AVAILABLE
                         )
+                        if new_params is None:
+                            print("[RSS] Compaction skipped; continuing with teacher.")
+                        else:
+                            xyz_tensors = gaussians.replace_tensor_to_optimizer(new_params["xyz"], "xyz")
+                            gaussians._xyz = xyz_tensors["xyz"]
+                            f_dc_tensors = gaussians.replace_tensor_to_optimizer(new_params["f_dc"], "f_dc")
+                            gaussians._features_dc = f_dc_tensors["f_dc"]
+                            f_rest_tensors = gaussians.replace_tensor_to_optimizer(new_params["f_rest"], "f_rest")
+                            gaussians._features_rest = f_rest_tensors["f_rest"]
+                            opacity_tensors = gaussians.replace_tensor_to_optimizer(new_params["opacity"], "opacity")
+                            gaussians._opacity = opacity_tensors["opacity"]
+                            scaling_tensors = gaussians.replace_tensor_to_optimizer(new_params["scaling"], "scaling")
+                            gaussians._scaling = scaling_tensors["scaling"]
+                            rotation_tensors = gaussians.replace_tensor_to_optimizer(new_params["rotation"], "rotation")
+                            gaussians._rotation = rotation_tensors["rotation"]
 
-                        xyz_tensors = gaussians.replace_tensor_to_optimizer(new_params["xyz"], "xyz")
-                        gaussians._xyz = xyz_tensors["xyz"]
-                        f_dc_tensors = gaussians.replace_tensor_to_optimizer(new_params["f_dc"], "f_dc")
-                        gaussians._features_dc = f_dc_tensors["f_dc"]
-                        f_rest_tensors = gaussians.replace_tensor_to_optimizer(new_params["f_rest"], "f_rest")
-                        gaussians._features_rest = f_rest_tensors["f_rest"]
-                        opacity_tensors = gaussians.replace_tensor_to_optimizer(new_params["opacity"], "opacity")
-                        gaussians._opacity = opacity_tensors["opacity"]
-                        scaling_tensors = gaussians.replace_tensor_to_optimizer(new_params["scaling"], "scaling")
-                        gaussians._scaling = scaling_tensors["scaling"]
-                        rotation_tensors = gaussians.replace_tensor_to_optimizer(new_params["rotation"], "rotation")
-                        gaussians._rotation = rotation_tensors["rotation"]
-
-                        gaussians.xyz_gradient_accum = torch.zeros((gaussians.get_xyz.shape[0], 1), device="cuda")
-                        gaussians.denom = torch.zeros((gaussians.get_xyz.shape[0], 1), device="cuda")
-                        gaussians.max_radii2D = torch.zeros((gaussians.get_xyz.shape[0]), device="cuda")
-                        gaussians.optimizer.zero_grad(set_to_none=True)
-                        gaussians.exposure_optimizer.zero_grad(set_to_none=True)
-                        if torch.cuda.is_available():
-                            peak_mem = torch.cuda.max_memory_allocated()
-                            print(f"[RSS] Peak CUDA memory: {peak_mem / (1024 ** 3):.2f} GB")
-                        print(
-                            "[RSS] Timing: render+sample={:.2f}s voxel={:.2f}s "
-                            "kdtree={:.2f}s total={:.2f}s voxel_size={:.6f} "
-                            "M={:.0f} K={:.0f}".format(
-                                timings.get("render_sampling", 0.0),
-                                timings.get("voxel", 0.0),
-                                timings.get("kdtree", 0.0),
-                                timings.get("total", 0.0),
-                                timings.get("voxel_size", 0.0),
-                                timings.get("num_samples", 0.0),
-                                timings.get("num_centers", 0.0),
+                            gaussians.xyz_gradient_accum = torch.zeros((gaussians.get_xyz.shape[0], 1), device="cuda")
+                            gaussians.denom = torch.zeros((gaussians.get_xyz.shape[0], 1), device="cuda")
+                            gaussians.max_radii2D = torch.zeros((gaussians.get_xyz.shape[0]), device="cuda")
+                            gaussians.optimizer.zero_grad(set_to_none=True)
+                            gaussians.exposure_optimizer.zero_grad(set_to_none=True)
+                            if torch.cuda.is_available():
+                                peak_mem = torch.cuda.max_memory_allocated()
+                                print(f"[RSS] Peak CUDA memory: {peak_mem / (1024 ** 3):.2f} GB")
+                            print(
+                                "[RSS] Timing: render+sample={:.2f}s voxel={:.2f}s "
+                                "kdtree={:.2f}s total={:.2f}s voxel_size={:.6f} "
+                                "M={:.0f} K={:.0f}".format(
+                                    timings.get("render_sampling", 0.0),
+                                    timings.get("voxel", 0.0),
+                                    timings.get("kdtree", 0.0),
+                                    timings.get("total", 0.0),
+                                    timings.get("voxel_size", 0.0),
+                                    timings.get("num_samples", 0.0),
+                                    timings.get("num_centers", 0.0),
+                                )
                             )
-                        )
-                        compaction.finetune_start = time.time()
-                        skip_step = True
+                            compaction.finetune_start = time.time()
+                            skip_step = True
                     else:
                         gaussians = subsampling(gaussians, compaction.ratio[index], 42, compaction.method)
             # Optimizer step

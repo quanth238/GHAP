@@ -31,6 +31,10 @@ class RSSVoxelConfig:
     voxel_size: float
     depth_gate: bool
     seed: int
+    world_bound_scale: float = 4.0
+    bbox_percentiles: Tuple[float, float] = (1.0, 99.0)
+    min_centers_frac: float = 0.7
+    min_centers_abs: int = 20000
 
 
 def _select_view_indices(num_views: int, total_views: int) -> np.ndarray:
@@ -162,8 +166,59 @@ def _sample_surface_points(
     return pts.detach().cpu().numpy().astype(np.float32), wts.detach().cpu().numpy().astype(np.float32)
 
 
+def _filter_points(
+    points: np.ndarray,
+    weights: np.ndarray,
+    scene_extent: float,
+    cfg: RSSVoxelConfig,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
+    stats = {
+        "raw": float(points.shape[0]),
+        "kept": float(points.shape[0]),
+        "dropped_bound": 0.0,
+        "dropped_percentile": 0.0,
+    }
+    if points.shape[0] == 0:
+        return points, weights, stats
+
+    finite_mask = np.isfinite(points).all(axis=1) & np.isfinite(weights)
+    points = points[finite_mask]
+    weights = weights[finite_mask]
+
+    if points.shape[0] == 0:
+        stats["kept"] = 0.0
+        return points, weights, stats
+
+    if scene_extent > 0 and cfg.world_bound_scale > 0:
+        max_radius = scene_extent * cfg.world_bound_scale
+        radii = np.linalg.norm(points, axis=1)
+        bound_mask = radii <= max_radius
+        stats["dropped_bound"] = float((~bound_mask).sum())
+        points = points[bound_mask]
+        weights = weights[bound_mask]
+
+    if points.shape[0] == 0:
+        stats["kept"] = 0.0
+        return points, weights, stats
+
+    p_low, p_high = cfg.bbox_percentiles
+    if 0.0 < p_low < p_high < 100.0 and points.shape[0] > 1024:
+        low = np.percentile(points, p_low, axis=0)
+        high = np.percentile(points, p_high, axis=0)
+        bbox_mask = np.logical_and(points >= low, points <= high).all(axis=1)
+        kept = int(bbox_mask.sum())
+        # Avoid over-filtering if the percentile bbox is degenerate.
+        if kept > 0 and kept >= int(0.5 * points.shape[0]):
+            stats["dropped_percentile"] = float(points.shape[0] - kept)
+            points = points[bbox_mask]
+            weights = weights[bbox_mask]
+
+    stats["kept"] = float(points.shape[0])
+    return points, weights, stats
+
+
 def _voxelize(points: np.ndarray, weights: np.ndarray, min_xyz: np.ndarray, voxel_size: float) -> Tuple[np.ndarray, np.ndarray]:
-    coords = np.floor((points - min_xyz) / voxel_size).astype(np.int32)
+    coords = np.floor((points - min_xyz) / voxel_size).astype(np.int64)
     coords_view = coords.view([("", coords.dtype)] * 3).reshape(-1)
     unique_coords, inv = np.unique(coords_view, return_inverse=True)
 
@@ -178,7 +233,7 @@ def _voxelize(points: np.ndarray, weights: np.ndarray, min_xyz: np.ndarray, voxe
 
 
 def _voxel_count(points: np.ndarray, min_xyz: np.ndarray, voxel_size: float) -> int:
-    coords = np.floor((points - min_xyz) / voxel_size).astype(np.int32)
+    coords = np.floor((points - min_xyz) / voxel_size).astype(np.int64)
     coords_view = coords.view([("", coords.dtype)] * 3).reshape(-1)
     unique_coords = np.unique(coords_view)
     return int(unique_coords.shape[0])
@@ -187,10 +242,11 @@ def _voxel_count(points: np.ndarray, min_xyz: np.ndarray, voxel_size: float) -> 
 def _search_voxel_size(
     points: np.ndarray,
     min_xyz: np.ndarray,
+    max_xyz: np.ndarray,
     target_k: int,
     iters: int,
 ) -> float:
-    bbox = points.max(axis=0) - min_xyz
+    bbox = max_xyz - min_xyz
     bbox = np.maximum(bbox, 1e-6)
     base = float((bbox[0] * bbox[1] * bbox[2] / max(target_k, 1)) ** (1.0 / 3.0))
     s_low = base * 0.25
@@ -220,8 +276,9 @@ def _select_centers(points: np.ndarray, weights: np.ndarray, cfg: RSSVoxelConfig
         raise ValueError("No surface samples collected.")
 
     min_xyz = points.min(axis=0)
+    max_xyz = points.max(axis=0)
     if cfg.voxel_search:
-        voxel_size = _search_voxel_size(points, min_xyz, cfg.target_num_gaussians, cfg.voxel_search_iters)
+        voxel_size = _search_voxel_size(points, min_xyz, max_xyz, cfg.target_num_gaussians, cfg.voxel_search_iters)
     else:
         if cfg.voxel_size <= 0:
             raise ValueError("rss_voxel_size must be > 0 when voxel search is disabled.")
@@ -301,7 +358,23 @@ def build_student_from_rss_voxel(
 
     points = np.concatenate(points_list, axis=0)
     weights = np.concatenate(weights_list, axis=0)
+    timings["num_samples_raw"] = float(points.shape[0])
+
+    points, weights, filter_stats = _filter_points(points, weights, scene.cameras_extent, cfg)
     timings["num_samples"] = float(points.shape[0])
+    if filter_stats["kept"] < filter_stats["raw"]:
+        print(
+            "[RSS] Filtered samples: raw={:.0f} kept={:.0f} dropped_bound={:.0f} "
+            "dropped_percentile={:.0f}".format(
+                filter_stats["raw"],
+                filter_stats["kept"],
+                filter_stats["dropped_bound"],
+                filter_stats["dropped_percentile"],
+            )
+        )
+
+    if points.shape[0] == 0:
+        raise RuntimeError("RSS sampling produced 0 valid points after filtering.")
 
     if points.shape[0] < 4 * cfg.target_num_gaussians:
         print(
@@ -318,6 +391,18 @@ def build_student_from_rss_voxel(
             f"[RSS] Warning: voxelization produced K={centers.shape[0]} < target {cfg.target_num_gaussians}. "
             "Consider decreasing voxel size or increasing rss_voxel_search_iters."
         )
+    min_allowed = max(
+        int(cfg.target_num_gaussians * cfg.min_centers_frac),
+        cfg.min_centers_abs,
+    )
+    if centers.shape[0] < min_allowed:
+        timings["skip_reason"] = "low_centers"
+        timings["min_centers_allowed"] = float(min_allowed)
+        print(
+            f"[RSS] Abort compaction: centers={centers.shape[0]} < min_allowed={min_allowed}. "
+            "Keeping teacher."
+        )
+        return None, timings
 
     t0 = time.time()
     teacher_xyz = gaussians.get_xyz.detach().cpu().numpy()
