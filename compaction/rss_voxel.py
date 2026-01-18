@@ -541,6 +541,8 @@ def build_student_from_rss_voxel(
                 centers.shape[0],
             )
         )
+        # Recompute NN distances after snapping for accurate debug.
+        dist, nn_idx = tree.query(centers, k=1, workers=-1)
 
     if cfg.debug:
         dist = dist.astype(np.float32)
@@ -586,6 +588,37 @@ def build_student_from_rss_voxel(
         clamped_opacity = torch.clamp(teacher_opacity, min=0.05, max=0.9)
         new_opacity = inverse_sigmoid(clamped_opacity)
         new_rotation = teacher_rotation
+        if cfg.debug:
+            teach_op = gaussians.get_opacity.detach()
+            teach_scale = gaussians.get_scaling.detach()
+            print(
+                "[RSS][Debug] Teacher opacity: mean={:.4f} p05={:.4f} p95={:.4f}".format(
+                    float(teach_op.mean().item()),
+                    float(torch.quantile(teach_op, 0.05).item()),
+                    float(torch.quantile(teach_op, 0.95).item()),
+                )
+            )
+            print(
+                "[RSS][Debug] Student opacity: mean={:.4f} p05={:.4f} p95={:.4f}".format(
+                    float(clamped_opacity.mean().item()),
+                    float(torch.quantile(clamped_opacity, 0.05).item()),
+                    float(torch.quantile(clamped_opacity, 0.95).item()),
+                )
+            )
+            print(
+                "[RSS][Debug] Teacher scale: mean={:.4f} p05={:.4f} p95={:.4f}".format(
+                    float(teach_scale.mean().item()),
+                    float(torch.quantile(teach_scale, 0.05).item()),
+                    float(torch.quantile(teach_scale, 0.95).item()),
+                )
+            )
+            print(
+                "[RSS][Debug] Student scale: mean={:.4f} p05={:.4f} p95={:.4f}".format(
+                    float(clamped_scaling.mean().item()),
+                    float(torch.quantile(clamped_scaling, 0.05).item()),
+                    float(torch.quantile(clamped_scaling, 0.95).item()),
+                )
+            )
 
     timings["total"] = time.time() - start_total
     timings["voxel_size"] = float(voxel_size)
