@@ -1,0 +1,340 @@
+import time
+from dataclasses import dataclass
+from typing import Dict, Tuple
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from gaussian_renderer import render
+from utils.graphics_utils import fov2focal, geom_transform_points
+
+try:
+    from scipy.spatial import cKDTree
+except Exception:
+    cKDTree = None
+
+
+@dataclass
+class RSSVoxelConfig:
+    target_num_gaussians: int
+    num_views: int
+    pixels_per_view: int
+    alpha_tau: float
+    lambda_tex: float
+    voxel_search: bool
+    voxel_search_iters: int
+    voxel_size: float
+    depth_gate: bool
+    seed: int
+
+
+def _select_view_indices(num_views: int, total_views: int) -> np.ndarray:
+    if total_views <= 0:
+        return np.array([], dtype=np.int64)
+    if num_views >= total_views:
+        return np.arange(total_views, dtype=np.int64)
+    return np.linspace(0, total_views - 1, num_views, dtype=np.int64)
+
+
+def _compute_texture_grad(image: torch.Tensor) -> torch.Tensor:
+    # image: (3, H, W) in [0, 1]
+    r = image[0:1]
+    g = image[1:2]
+    b = image[2:3]
+    gray = 0.2989 * r + 0.5870 * g + 0.1140 * b
+    gray = gray.unsqueeze(0)
+
+    sobel_x = torch.tensor(
+        [[1.0, 0.0, -1.0], [2.0, 0.0, -2.0], [1.0, 0.0, -1.0]],
+        device=gray.device,
+        dtype=gray.dtype,
+    ).view(1, 1, 3, 3)
+    sobel_y = torch.tensor(
+        [[1.0, 2.0, 1.0], [0.0, 0.0, 0.0], [-1.0, -2.0, -1.0]],
+        device=gray.device,
+        dtype=gray.dtype,
+    ).view(1, 1, 3, 3)
+
+    grad_x = F.conv2d(gray, sobel_x, padding=1)
+    grad_y = F.conv2d(gray, sobel_y, padding=1)
+    grad = torch.sqrt(grad_x * grad_x + grad_y * grad_y).squeeze(0).squeeze(0)
+    grad_min = grad.min()
+    grad_max = grad.max()
+    grad = (grad - grad_min) / (grad_max - grad_min + 1e-6)
+    return grad
+
+
+def _render_alpha_and_invdepth(view, gaussians, pipe, separate_sh) -> Tuple[torch.Tensor, torch.Tensor]:
+    device = gaussians.get_xyz.device
+    bg_black = torch.zeros(3, dtype=torch.float32, device=device)
+    bg_white = torch.ones(3, dtype=torch.float32, device=device)
+
+    with torch.no_grad():
+        render0 = render(view, gaussians, pipe, bg_black, use_trained_exp=False, separate_sh=separate_sh)
+        render1 = render(view, gaussians, pipe, bg_white, use_trained_exp=False, separate_sh=separate_sh)
+
+    color0 = render0["render"]
+    color1 = render1["render"]
+    invdepth = render0["depth"][0]
+
+    alpha = 1.0 - (color1 - color0).mean(dim=0)
+    alpha = alpha.clamp(0.0, 1.0)
+    return alpha, invdepth
+
+
+def _backproject(view, u, v, depth) -> torch.Tensor:
+    fx = fov2focal(view.FoVx, view.image_width)
+    fy = fov2focal(view.FoVy, view.image_height)
+    cx = (view.image_width - 1) * 0.5
+    cy = (view.image_height - 1) * 0.5
+
+    x = (u - cx) / fx * depth
+    y = (v - cy) / fy * depth
+    z = depth
+    points_cam = torch.stack([x, y, z], dim=1)
+    view_to_world = view.world_view_transform.inverse()
+    points_world = geom_transform_points(points_cam, view_to_world)
+    return points_world
+
+
+def _sample_surface_points(
+    view,
+    alpha: torch.Tensor,
+    invdepth: torch.Tensor,
+    tex_grad: torch.Tensor,
+    cfg: RSSVoxelConfig,
+) -> Tuple[np.ndarray, np.ndarray]:
+    device = alpha.device
+    h, w = alpha.shape
+    total_pixels = h * w
+    alpha_flat = alpha.reshape(-1)
+    invdepth_flat = invdepth.reshape(-1)
+    tex_flat = tex_grad.reshape(-1) if tex_grad is not None else None
+
+    eps = 1e-6
+    max_attempts = 8
+    points_world = []
+    weights = []
+
+    needed = cfg.pixels_per_view
+    for _ in range(max_attempts):
+        if needed <= 0:
+            break
+        candidates = max(needed * 2, 1024)
+        idx = torch.randint(0, total_pixels, (candidates,), device=device)
+        a = alpha_flat[idx]
+        valid = a > cfg.alpha_tau
+
+        invd = invdepth_flat[idx]
+        valid = torch.logical_and(valid, invd > 0)
+        depth = 1.0 / (invd + eps)
+        if cfg.depth_gate:
+            valid = torch.logical_and(valid, depth > view.znear)
+            valid = torch.logical_and(valid, depth < view.zfar)
+
+        if tex_flat is not None and cfg.lambda_tex > 0:
+            wts = a * (1.0 + cfg.lambda_tex * tex_flat[idx])
+        else:
+            wts = a
+
+        if valid.any():
+            keep = min(needed, int(valid.sum().item()))
+            valid_idx = idx[valid][:keep]
+            depth = depth[valid][:keep]
+            wts = wts[valid][:keep]
+            u = (valid_idx % w).float()
+            v = (valid_idx // w).float()
+            pts = _backproject(view, u, v, depth)
+            points_world.append(pts)
+            weights.append(wts)
+            needed -= keep
+
+    if not points_world:
+        return np.zeros((0, 3), dtype=np.float32), np.zeros((0,), dtype=np.float32)
+
+    pts = torch.cat(points_world, dim=0)
+    wts = torch.cat(weights, dim=0)
+    return pts.detach().cpu().numpy().astype(np.float32), wts.detach().cpu().numpy().astype(np.float32)
+
+
+def _voxelize(points: np.ndarray, weights: np.ndarray, min_xyz: np.ndarray, voxel_size: float) -> Tuple[np.ndarray, np.ndarray]:
+    coords = np.floor((points - min_xyz) / voxel_size).astype(np.int32)
+    coords_view = coords.view([("", coords.dtype)] * 3).reshape(-1)
+    unique_coords, inv = np.unique(coords_view, return_inverse=True)
+
+    mass = np.bincount(inv, weights=weights)
+    sum_x = np.bincount(inv, weights=weights * points[:, 0])
+    sum_y = np.bincount(inv, weights=weights * points[:, 1])
+    sum_z = np.bincount(inv, weights=weights * points[:, 2])
+    mass = np.maximum(mass, 1e-8)
+
+    centers = np.stack([sum_x / mass, sum_y / mass, sum_z / mass], axis=1)
+    return centers.astype(np.float32), mass.astype(np.float32)
+
+
+def _voxel_count(points: np.ndarray, min_xyz: np.ndarray, voxel_size: float) -> int:
+    coords = np.floor((points - min_xyz) / voxel_size).astype(np.int32)
+    coords_view = coords.view([("", coords.dtype)] * 3).reshape(-1)
+    unique_coords = np.unique(coords_view)
+    return int(unique_coords.shape[0])
+
+
+def _search_voxel_size(
+    points: np.ndarray,
+    min_xyz: np.ndarray,
+    target_k: int,
+    iters: int,
+) -> float:
+    bbox = points.max(axis=0) - min_xyz
+    bbox = np.maximum(bbox, 1e-6)
+    base = float((bbox[0] * bbox[1] * bbox[2] / max(target_k, 1)) ** (1.0 / 3.0))
+    s_low = base * 0.25
+    s_high = base * 4.0
+
+    for _ in range(12):
+        if _voxel_count(points, min_xyz, s_low) >= target_k:
+            break
+        s_low *= 0.5
+    for _ in range(12):
+        if _voxel_count(points, min_xyz, s_high) <= target_k:
+            break
+        s_high *= 2.0
+
+    for _ in range(iters):
+        s_mid = 0.5 * (s_low + s_high)
+        count = _voxel_count(points, min_xyz, s_mid)
+        if count > target_k:
+            s_low = s_mid
+        else:
+            s_high = s_mid
+    return s_high
+
+
+def _select_centers(points: np.ndarray, weights: np.ndarray, cfg: RSSVoxelConfig) -> Tuple[np.ndarray, float]:
+    if points.shape[0] == 0:
+        raise ValueError("No surface samples collected.")
+
+    min_xyz = points.min(axis=0)
+    if cfg.voxel_search:
+        voxel_size = _search_voxel_size(points, min_xyz, cfg.target_num_gaussians, cfg.voxel_search_iters)
+    else:
+        if cfg.voxel_size <= 0:
+            raise ValueError("rss_voxel_size must be > 0 when voxel search is disabled.")
+        voxel_size = cfg.voxel_size
+
+    centers, mass = _voxelize(points, weights, min_xyz, voxel_size)
+
+    if centers.shape[0] > cfg.target_num_gaussians:
+        keep = np.argpartition(mass, -cfg.target_num_gaussians)[-cfg.target_num_gaussians:]
+        centers = centers[keep]
+    elif centers.shape[0] < cfg.target_num_gaussians:
+        missing = cfg.target_num_gaussians - centers.shape[0]
+        weight_sum = weights.sum()
+        prob = None if weight_sum <= 0 else (weights / weight_sum)
+        extra_idx = np.random.choice(points.shape[0], size=missing, replace=True, p=prob)
+        centers = np.concatenate([centers, points[extra_idx]], axis=0)
+
+    return centers.astype(np.float32), voxel_size
+
+
+def build_student_from_rss_voxel(
+    gaussians,
+    scene,
+    dataset,
+    pipe,
+    cfg: RSSVoxelConfig,
+    separate_sh: bool,
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, float]]:
+    timings: Dict[str, float] = {}
+    start_total = time.time()
+
+    np.random.seed(cfg.seed)
+    torch.manual_seed(cfg.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cfg.seed)
+
+    cams = scene.getTrainCameras().copy()
+    view_indices = _select_view_indices(cfg.num_views, len(cams))
+
+    points_list = []
+    weights_list = []
+    render_time = 0.0
+    sample_time = 0.0
+
+    for idx in view_indices:
+        view = cams[int(idx)]
+        t0 = time.time()
+        alpha, invdepth = _render_alpha_and_invdepth(view, gaussians, pipe, separate_sh)
+        render_time += time.time() - t0
+
+        if view.alpha_mask is not None:
+            alpha = alpha * view.alpha_mask[0].to(alpha.device)
+
+        tex_grad = None
+        if cfg.lambda_tex > 0:
+            tex_grad = _compute_texture_grad(view.original_image.to(alpha.device))
+            if view.alpha_mask is not None:
+                tex_grad = tex_grad * view.alpha_mask[0].to(tex_grad.device)
+
+        t0 = time.time()
+        pts, wts = _sample_surface_points(view, alpha, invdepth, tex_grad, cfg)
+        sample_time += time.time() - t0
+
+        if pts.shape[0] == 0:
+            continue
+        points_list.append(pts)
+        weights_list.append(wts)
+
+    timings["render_sampling"] = render_time + sample_time
+
+    if not points_list:
+        raise RuntimeError("RSS sampling collected 0 points across views.")
+
+    points = np.concatenate(points_list, axis=0)
+    weights = np.concatenate(weights_list, axis=0)
+    timings["num_samples"] = float(points.shape[0])
+
+    if points.shape[0] < 4 * cfg.target_num_gaussians:
+        print(
+            f"[RSS] Warning: M={points.shape[0]} is < 4*K={4 * cfg.target_num_gaussians}. "
+            "Consider increasing rss_num_views or rss_pixels_per_view."
+        )
+
+    t0 = time.time()
+    centers, voxel_size = _select_centers(points, weights, cfg)
+    timings["num_centers"] = float(centers.shape[0])
+    timings["voxel"] = time.time() - t0
+
+    t0 = time.time()
+    teacher_xyz = gaussians.get_xyz.detach().cpu().numpy()
+    if cKDTree is None:
+        raise RuntimeError("SciPy not available for KD-tree search.")
+    tree = cKDTree(teacher_xyz)
+    _, nn_idx = tree.query(centers, k=1, workers=-1)
+    timings["kdtree"] = time.time() - t0
+
+    device = gaussians.get_xyz.device
+    dtype = gaussians.get_xyz.dtype
+    nn_idx_t = torch.from_numpy(nn_idx).to(device=device, dtype=torch.long)
+    centers_t = torch.from_numpy(centers).to(device=device, dtype=dtype)
+
+    with torch.no_grad():
+        new_features_dc = gaussians._features_dc[nn_idx_t].detach().clone()
+        new_features_rest = gaussians._features_rest[nn_idx_t].detach().clone()
+        new_opacity = gaussians._opacity[nn_idx_t].detach().clone()
+        new_scaling = gaussians._scaling[nn_idx_t].detach().clone()
+        new_rotation = gaussians._rotation[nn_idx_t].detach().clone()
+
+    timings["total"] = time.time() - start_total
+    timings["voxel_size"] = float(voxel_size)
+
+    new_params = {
+        "xyz": centers_t,
+        "f_dc": new_features_dc,
+        "f_rest": new_features_rest,
+        "opacity": new_opacity,
+        "scaling": new_scaling,
+        "rotation": new_rotation,
+    }
+    return new_params, timings

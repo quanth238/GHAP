@@ -26,6 +26,7 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+from compaction.rss_voxel import RSSVoxelConfig, build_student_from_rss_voxel
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -191,7 +192,68 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if compaction.flag:
                 if iteration in compaction.iter:
                     index = compaction.iter.index(iteration)
-                    gaussians = subsampling(gaussians, compaction.ratio[index], 42, compaction.method)
+                    if compaction.method == "rss_voxel":
+                        if torch.cuda.is_available():
+                            torch.cuda.reset_peak_memory_stats()
+                        target_k = compaction.target_num_gaussians
+                        if target_k <= 0:
+                            ratio = compaction.ratio[index]
+                            target_k = int(ratio) if ratio > 1 else max(1, int(gaussians.get_xyz.shape[0] * ratio))
+                        target_k = min(target_k, gaussians.get_xyz.shape[0])
+                        print(f"[RSS] Target K={target_k}")
+
+                        cfg = RSSVoxelConfig(
+                            target_num_gaussians=target_k,
+                            num_views=compaction.rss_num_views,
+                            pixels_per_view=compaction.rss_pixels_per_view,
+                            alpha_tau=compaction.rss_alpha_tau,
+                            lambda_tex=compaction.rss_lambda_tex,
+                            voxel_search=compaction.rss_voxel_search,
+                            voxel_search_iters=compaction.rss_voxel_search_iters,
+                            voxel_size=compaction.rss_voxel_size,
+                            depth_gate=compaction.rss_depth_gate,
+                            seed=compaction.rss_seed,
+                        )
+
+                        new_params, timings = build_student_from_rss_voxel(
+                            gaussians, scene, dataset, pipe, cfg, SPARSE_ADAM_AVAILABLE
+                        )
+
+                        xyz_tensors = gaussians.replace_tensor_to_optimizer(new_params["xyz"], "xyz")
+                        gaussians._xyz = xyz_tensors["xyz"]
+                        f_dc_tensors = gaussians.replace_tensor_to_optimizer(new_params["f_dc"], "f_dc")
+                        gaussians._features_dc = f_dc_tensors["f_dc"]
+                        f_rest_tensors = gaussians.replace_tensor_to_optimizer(new_params["f_rest"], "f_rest")
+                        gaussians._features_rest = f_rest_tensors["f_rest"]
+                        opacity_tensors = gaussians.replace_tensor_to_optimizer(new_params["opacity"], "opacity")
+                        gaussians._opacity = opacity_tensors["opacity"]
+                        scaling_tensors = gaussians.replace_tensor_to_optimizer(new_params["scaling"], "scaling")
+                        gaussians._scaling = scaling_tensors["scaling"]
+                        rotation_tensors = gaussians.replace_tensor_to_optimizer(new_params["rotation"], "rotation")
+                        gaussians._rotation = rotation_tensors["rotation"]
+
+                        gaussians.xyz_gradient_accum = torch.zeros((gaussians.get_xyz.shape[0], 1), device="cuda")
+                        gaussians.denom = torch.zeros((gaussians.get_xyz.shape[0], 1), device="cuda")
+                        gaussians.max_radii2D = torch.zeros((gaussians.get_xyz.shape[0]), device="cuda")
+                        if torch.cuda.is_available():
+                            peak_mem = torch.cuda.max_memory_allocated()
+                            print(f"[RSS] Peak CUDA memory: {peak_mem / (1024 ** 3):.2f} GB")
+                        print(
+                            "[RSS] Timing: render+sample={:.2f}s voxel={:.2f}s "
+                            "kdtree={:.2f}s total={:.2f}s voxel_size={:.6f} "
+                            "M={:.0f} K={:.0f}".format(
+                                timings.get("render_sampling", 0.0),
+                                timings.get("voxel", 0.0),
+                                timings.get("kdtree", 0.0),
+                                timings.get("total", 0.0),
+                                timings.get("voxel_size", 0.0),
+                                timings.get("num_samples", 0.0),
+                                timings.get("num_centers", 0.0),
+                            )
+                        )
+                        compaction.finetune_start = time.time()
+                    else:
+                        gaussians = subsampling(gaussians, compaction.ratio[index], 42, compaction.method)
             # Optimizer step
             if iteration < opt.iterations:
                 gaussians.exposure_optimizer.step()
@@ -207,6 +269,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+
+    if compaction is not None and compaction.method == "rss_voxel":
+        if compaction.finetune_start is not None:
+            finetune_time = time.time() - compaction.finetune_start
+            print(f"[RSS] Finetune time: {finetune_time:.2f}s")
 
 def prepare_output_and_logger(args):
     if not args.model_path:
@@ -350,8 +417,25 @@ if __name__ == "__main__":
     parser.add_argument("--sampling_ratio", type=float, nargs='+', default=[0.05])
     parser.add_argument('--random', action='store_true', default=False)
     parser.add_argument("--block_num", type=int, default=3000)
+    parser.add_argument("--compaction_method", type=str, default="ghap",
+                        choices=["ghap", "rss_voxel", "render_surface_resample"])
+    parser.add_argument("--target_num_gaussians", type=int, default=0)
+    parser.add_argument("--rss_num_views", type=int, default=200)
+    parser.add_argument("--rss_pixels_per_view", type=int, default=10000)
+    parser.add_argument("--rss_alpha_tau", type=float, default=0.05)
+    parser.add_argument("--rss_lambda_tex", type=float, default=0.5)
+    parser.add_argument("--rss_voxel_search_iters", type=int, default=8)
+    parser.add_argument("--rss_voxel_size", type=float, default=0.0)
+    parser.add_argument("--rss_no_voxel_search", action="store_true", default=False)
+    parser.add_argument("--rss_no_depth_gate", action="store_true", default=False)
+    parser.add_argument("--rss_seed", type=int, default=42)
+    parser.add_argument("--iteration", type=int, default=None)
 
     args = parser.parse_args(sys.argv[1:])
+    if args.iteration is not None:
+        args.iterations = args.iteration
+    if args.compaction_method != "ghap":
+        args.compact = True
     args.save_iterations.append(args.iterations)
 
     print("Optimizing " + args.model_path)
@@ -359,16 +443,62 @@ if __name__ == "__main__":
     # Initialize system state (RNG)
     safe_state(args.quiet)
     class Compact:
-        def __init__(self, compact, sampling_iter, sampling_ratio, random):
+        def __init__(
+            self,
+            compact,
+            sampling_iter,
+            sampling_ratio,
+            random,
+            compaction_method,
+            target_num_gaussians,
+            rss_num_views,
+            rss_pixels_per_view,
+            rss_alpha_tau,
+            rss_lambda_tex,
+            rss_voxel_search_iters,
+            rss_voxel_size,
+            rss_no_voxel_search,
+            rss_no_depth_gate,
+            rss_seed,
+        ):
             self.flag = compact
             self.iter = sampling_iter
             self.ratio = sampling_ratio
-            if random == True:
-                self.method = 'random'
+            if compaction_method == "render_surface_resample":
+                compaction_method = "rss_voxel"
+            if compaction_method == "rss_voxel":
+                self.method = "rss_voxel"
             else:
-                self.method = 'GMR'
+                self.method = "random" if random else "GMR"
+            self.target_num_gaussians = target_num_gaussians
+            self.rss_num_views = rss_num_views
+            self.rss_pixels_per_view = rss_pixels_per_view
+            self.rss_alpha_tau = rss_alpha_tau
+            self.rss_lambda_tex = rss_lambda_tex
+            self.rss_voxel_search_iters = rss_voxel_search_iters
+            self.rss_voxel_size = rss_voxel_size
+            self.rss_voxel_search = not rss_no_voxel_search
+            self.rss_depth_gate = not rss_no_depth_gate
+            self.rss_seed = rss_seed
+            self.finetune_start = None
     # Start GUI server, configure and run training
-    compaction = Compact(args.compact, args.sampling_iter, args.sampling_ratio, args.random)
+    compaction = Compact(
+        args.compact,
+        args.sampling_iter,
+        args.sampling_ratio,
+        args.random,
+        args.compaction_method,
+        args.target_num_gaussians,
+        args.rss_num_views,
+        args.rss_pixels_per_view,
+        args.rss_alpha_tau,
+        args.rss_lambda_tex,
+        args.rss_voxel_search_iters,
+        args.rss_voxel_size,
+        args.rss_no_voxel_search,
+        args.rss_no_depth_gate,
+        args.rss_seed,
+    )
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
