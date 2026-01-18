@@ -31,12 +31,11 @@ bash run_from_pointcloud.sh <scene_name> <source_path> [<ckp_path>] [<compact_ra
 ```
 
 ##### Option 2b: RSS-Voxel (render-surface resample)
-This adds a new compaction method that resamples visible surfaces and voxelizes to reach a target K.
+This adds a new compaction method that resamples visible surfaces and voxelizes to reach a target ratio (or K if provided).
 
 ```
-bash run_from_pointcloud.sh <scene_name> <source_path> <ckp_path> \
+bash run_from_pointcloud.sh <scene_name> <source_path> <ckp_path> 0.1 \
   --compaction_method rss_voxel \
-  --target_num_gaussians 300000 \
   --rss_num_views 200 \
   --rss_pixels_per_view 10000
 ```

@@ -222,6 +222,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     if compaction.method == "rss_voxel":
                         if torch.cuda.is_available():
                             torch.cuda.reset_peak_memory_stats()
+                        pre_compact_count = int(gaussians.get_xyz.shape[0])
+                        if not getattr(compaction, "logged_counts", False):
+                            print(f"[RSS] Gaussians pre-compaction: {pre_compact_count}")
                         target_k = compaction.target_num_gaussians
                         if target_k <= 0:
                             ratio = compaction.ratio[index]
@@ -258,6 +261,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         )
                         if new_params is None:
                             print("[RSS] Compaction skipped; continuing with teacher.")
+                            if not getattr(compaction, "logged_counts", False):
+                                post_compact_count = int(gaussians.get_xyz.shape[0])
+                                print(f"[RSS] Gaussians post-compaction: {post_compact_count}")
+                                compaction.logged_counts = True
+                                compaction.did_compact = True
                         else:
                             if compaction.rss_debug:
                                 _log_optimizer_state(gaussians.optimizer, "pre_compaction")
@@ -295,6 +303,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                     timings.get("num_centers", 0.0),
                                 )
                             )
+                            if not getattr(compaction, "logged_counts", False):
+                                post_compact_count = int(gaussians.get_xyz.shape[0])
+                                print(f"[RSS] Gaussians post-compaction: {post_compact_count}")
+                                compaction.logged_counts = True
+                                compaction.did_compact = True
                             compaction.finetune_start = time.time()
                             skip_step = True
                             if compaction.rss_debug:
@@ -325,6 +338,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if compaction.finetune_start is not None:
             finetune_time = time.time() - compaction.finetune_start
             print(f"[RSS] Finetune time: {finetune_time:.2f}s")
+        if getattr(compaction, "did_compact", False):
+            final_count = int(scene.gaussians.get_xyz.shape[0])
+            print(f"[RSS] Final gaussians: {final_count}")
 
 def prepare_output_and_logger(args):
     if not args.model_path:
