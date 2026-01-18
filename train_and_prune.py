@@ -247,6 +247,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             snap_to_teacher=compaction.rss_snap_to_teacher,
                             snap_factor=compaction.rss_snap_factor,
                             snap_min=compaction.rss_snap_min,
+                            snap_unique=compaction.rss_snap_unique,
+                            snap_fill_teacher=compaction.rss_snap_fill_teacher,
                         )
 
                         new_params, timings = build_student_from_rss_voxel(
@@ -478,6 +480,8 @@ if __name__ == "__main__":
     parser.add_argument("--rss_snap_to_teacher", action="store_true", default=False)
     parser.add_argument("--rss_snap_factor", type=float, default=5.0)
     parser.add_argument("--rss_snap_min", type=float, default=0.0)
+    parser.add_argument("--rss_snap_unique", action="store_true", default=False)
+    parser.add_argument("--rss_snap_no_fill_teacher", action="store_true", default=False)
     parser.add_argument("--rss_voxel_search_iters", type=int, default=8)
     parser.add_argument("--rss_voxel_size", type=float, default=0.0)
     parser.add_argument("--rss_no_voxel_search", action="store_true", default=False)
@@ -516,6 +520,8 @@ if __name__ == "__main__":
             rss_snap_to_teacher,
             rss_snap_factor,
             rss_snap_min,
+            rss_snap_unique,
+            rss_snap_no_fill_teacher,
             rss_voxel_search_iters,
             rss_voxel_size,
             rss_no_voxel_search,
@@ -543,6 +549,8 @@ if __name__ == "__main__":
             self.rss_snap_to_teacher = rss_snap_to_teacher
             self.rss_snap_factor = rss_snap_factor
             self.rss_snap_min = rss_snap_min
+            self.rss_snap_unique = rss_snap_unique
+            self.rss_snap_fill_teacher = not rss_snap_no_fill_teacher
             self.rss_voxel_search_iters = rss_voxel_search_iters
             self.rss_voxel_size = rss_voxel_size
             self.rss_voxel_search = not rss_no_voxel_search
@@ -568,6 +576,8 @@ if __name__ == "__main__":
         args.rss_snap_to_teacher,
         args.rss_snap_factor,
         args.rss_snap_min,
+        args.rss_snap_unique,
+        args.rss_snap_no_fill_teacher,
         args.rss_voxel_search_iters,
         args.rss_voxel_size,
         args.rss_no_voxel_search,

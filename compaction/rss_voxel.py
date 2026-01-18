@@ -40,6 +40,8 @@ class RSSVoxelConfig:
     snap_to_teacher: bool = False
     snap_factor: float = 5.0
     snap_min: float = 0.0
+    snap_unique: bool = False
+    snap_fill_teacher: bool = True
 
 
 def _select_view_indices(num_views: int, total_views: int) -> np.ndarray:
@@ -545,6 +547,43 @@ def build_student_from_rss_voxel(
         unique_teacher = np.unique(nn_idx).shape[0]
         # Recompute NN distances after snapping for accurate debug.
         dist, nn_idx = tree.query(centers, k=1, workers=-1)
+
+    if cfg.snap_unique:
+        order = np.argsort(dist)
+        used = np.zeros(teacher_xyz.shape[0], dtype=bool)
+        keep_idx = []
+        for idx in order:
+            tid = nn_idx[idx]
+            if not used[tid]:
+                used[tid] = True
+                keep_idx.append(idx)
+                if len(keep_idx) >= cfg.target_num_gaussians:
+                    break
+        centers_kept = centers[np.array(keep_idx, dtype=np.int64)]
+        nn_idx_kept = nn_idx[np.array(keep_idx, dtype=np.int64)]
+        dist_kept = dist[np.array(keep_idx, dtype=np.int64)]
+
+        if centers_kept.shape[0] < cfg.target_num_gaussians and cfg.snap_fill_teacher:
+            unused = np.flatnonzero(~used)
+            needed = cfg.target_num_gaussians - centers_kept.shape[0]
+            if unused.size == 0:
+                print("[RSS] Snap unique: no unused teacher ids to fill.")
+            else:
+                take = np.random.choice(unused, size=min(needed, unused.size), replace=False)
+                centers_extra = teacher_xyz[take]
+                centers = np.concatenate([centers_kept, centers_extra], axis=0)
+                nn_idx = np.concatenate([nn_idx_kept, take], axis=0)
+                dist = np.concatenate([dist_kept, np.zeros(centers_extra.shape[0], dtype=dist_kept.dtype)], axis=0)
+        else:
+            centers = centers_kept
+            nn_idx = nn_idx_kept
+            dist = dist_kept
+
+        unique_teacher = np.unique(nn_idx).shape[0]
+        if centers.shape[0] < cfg.target_num_gaussians:
+            print(
+                f"[RSS] Snap unique: centers={centers.shape[0]} < target {cfg.target_num_gaussians}."
+            )
 
     if cfg.debug:
         dist = dist.astype(np.float32)
