@@ -523,6 +523,7 @@ def build_student_from_rss_voxel(
     dist, nn_idx = tree.query(centers, k=1, workers=-1)
     timings["kdtree"] = time.time() - t0
 
+    unique_teacher = None
     if cfg.snap_to_teacher:
         sample_n = min(200000, teacher_xyz.shape[0])
         sample_idx = np.random.choice(teacher_xyz.shape[0], size=sample_n, replace=False)
@@ -541,6 +542,7 @@ def build_student_from_rss_voxel(
                 centers.shape[0],
             )
         )
+        unique_teacher = np.unique(nn_idx).shape[0]
         # Recompute NN distances after snapping for accurate debug.
         dist, nn_idx = tree.query(centers, k=1, workers=-1)
 
@@ -554,6 +556,13 @@ def build_student_from_rss_voxel(
                     float(np.max(dist)),
                 )
             )
+        if unique_teacher is not None:
+            print(
+                "[RSS][Debug] Unique teacher ids in centers: {} / {}".format(
+                    int(unique_teacher),
+                    int(centers.shape[0]),
+                )
+            )
         sample_n = min(200000, teacher_xyz.shape[0])
         sample_idx = np.random.choice(teacher_xyz.shape[0], size=sample_n, replace=False)
         tdist, _ = tree.query(teacher_xyz[sample_idx], k=2, workers=-1)
@@ -564,6 +573,15 @@ def build_student_from_rss_voxel(
                     float(np.median(nn_dist)),
                     float(np.percentile(nn_dist, 95)),
                     float(np.max(nn_dist)),
+                )
+            )
+        tdist2, _ = tree.query(teacher_xyz, k=1, workers=-1)
+        if tdist2.size > 0:
+            print(
+                "[RSS][Debug] Teacher->center coverage: med={:.6f} p95={:.6f} max={:.6f}".format(
+                    float(np.median(tdist2)),
+                    float(np.percentile(tdist2, 95)),
+                    float(np.max(tdist2)),
                 )
             )
         print(f"[RSS][Debug] scene.cameras_extent={scene.cameras_extent:.6f}")
