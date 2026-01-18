@@ -519,6 +519,17 @@ def build_student_from_rss_voxel(
     tree = cKDTree(teacher_xyz)
     _, nn_idx = tree.query(centers, k=1, workers=-1)
     timings["kdtree"] = time.time() - t0
+    if cfg.debug:
+        dist, _ = tree.query(centers, k=1, workers=-1)
+        dist = dist.astype(np.float32)
+        if dist.size > 0:
+            print(
+                "[RSS][Debug] NN distance centers->teacher: med={:.6f} p95={:.6f} max={:.6f}".format(
+                    float(np.median(dist)),
+                    float(np.percentile(dist, 95)),
+                    float(np.max(dist)),
+                )
+            )
 
     device = gaussians.get_xyz.device
     dtype = gaussians.get_xyz.dtype
