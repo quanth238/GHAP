@@ -45,6 +45,32 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
+def _log_optimizer_state(optimizer, tag: str) -> None:
+    print(f"[RSS][Debug] Optimizer state ({tag})")
+    for group in optimizer.param_groups:
+        name = group.get("name", "unknown")
+        if not group["params"]:
+            print(f"[RSS][Debug]  {name}: no params")
+            continue
+        param = group["params"][0]
+        state = optimizer.state.get(param, None)
+        if not state or "exp_avg" not in state:
+            print(f"[RSS][Debug]  {name}: no exp_avg state")
+            continue
+        exp_avg = state["exp_avg"]
+        exp_avg_sq = state["exp_avg_sq"]
+        flat = exp_avg.view(-1)
+        step = max(1, flat.numel() // 200000)
+        sample = flat[::step]
+        mean_abs = float(sample.abs().mean().item())
+        max_abs = float(sample.abs().max().item())
+        flat2 = exp_avg_sq.view(-1)[::step]
+        mean_sq = float(flat2.mean().item())
+        print(
+            f"[RSS][Debug]  {name}: exp_avg_mean_abs={mean_abs:.6e} "
+            f"exp_avg_max_abs={max_abs:.6e} exp_avg_sq_mean={mean_sq:.6e}"
+        )
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, compaction=None):
     if compaction.flag:
         print('With Compaction!')
@@ -216,6 +242,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             voxel_size=compaction.rss_voxel_size,
                             depth_gate=compaction.rss_depth_gate,
                             seed=compaction.rss_seed,
+                            debug=compaction.rss_debug,
+                            debug_samples=compaction.rss_debug_samples,
                         )
 
                         new_params, timings = build_student_from_rss_voxel(
@@ -224,6 +252,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         if new_params is None:
                             print("[RSS] Compaction skipped; continuing with teacher.")
                         else:
+                            if compaction.rss_debug:
+                                _log_optimizer_state(gaussians.optimizer, "pre_compaction")
                             xyz_tensors = gaussians.replace_tensor_to_optimizer(new_params["xyz"], "xyz")
                             gaussians._xyz = xyz_tensors["xyz"]
                             f_dc_tensors = gaussians.replace_tensor_to_optimizer(new_params["f_dc"], "f_dc")
@@ -260,6 +290,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             )
                             compaction.finetune_start = time.time()
                             skip_step = True
+                            if compaction.rss_debug:
+                                _log_optimizer_state(gaussians.optimizer, "post_compaction")
                     else:
                         gaussians = subsampling(gaussians, compaction.ratio[index], 42, compaction.method)
             # Optimizer step
@@ -432,12 +464,14 @@ if __name__ == "__main__":
     parser.add_argument("--compaction_method", type=str, default="ghap",
                         choices=["ghap", "rss_voxel", "render_surface_resample"])
     parser.add_argument("--target_num_gaussians", type=int, default=0)
-    parser.add_argument("--rss_num_views", type=int, default=200)
-    parser.add_argument("--rss_pixels_per_view", type=int, default=10000)
+    parser.add_argument("--rss_num_views", type=int, default=300)
+    parser.add_argument("--rss_pixels_per_view", type=int, default=100_000)
     parser.add_argument("--rss_alpha_tau", type=float, default=0.05)
     parser.add_argument("--rss_lambda_tex", type=float, default=0.5)
     parser.add_argument("--rss_hit_quantile", type=float, default=0.7)
     parser.add_argument("--rss_depth_var_thresh", type=float, default=0.01)
+    parser.add_argument("--rss_debug", action="store_true", default=False)
+    parser.add_argument("--rss_debug_samples", type=int, default=10000)
     parser.add_argument("--rss_voxel_search_iters", type=int, default=8)
     parser.add_argument("--rss_voxel_size", type=float, default=0.0)
     parser.add_argument("--rss_no_voxel_search", action="store_true", default=False)
@@ -471,6 +505,8 @@ if __name__ == "__main__":
             rss_lambda_tex,
             rss_hit_quantile,
             rss_depth_var_thresh,
+            rss_debug,
+            rss_debug_samples,
             rss_voxel_search_iters,
             rss_voxel_size,
             rss_no_voxel_search,
@@ -493,6 +529,8 @@ if __name__ == "__main__":
             self.rss_lambda_tex = rss_lambda_tex
             self.rss_hit_quantile = rss_hit_quantile
             self.rss_depth_var_thresh = rss_depth_var_thresh
+            self.rss_debug = rss_debug
+            self.rss_debug_samples = rss_debug_samples
             self.rss_voxel_search_iters = rss_voxel_search_iters
             self.rss_voxel_size = rss_voxel_size
             self.rss_voxel_search = not rss_no_voxel_search
@@ -513,6 +551,8 @@ if __name__ == "__main__":
         args.rss_lambda_tex,
         args.rss_hit_quantile,
         args.rss_depth_var_thresh,
+        args.rss_debug,
+        args.rss_debug_samples,
         args.rss_voxel_search_iters,
         args.rss_voxel_size,
         args.rss_no_voxel_search,

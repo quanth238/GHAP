@@ -35,6 +35,8 @@ class RSSVoxelConfig:
     bbox_percentiles: Tuple[float, float] = (1.0, 99.0)
     min_centers_frac: float = 0.7
     min_centers_abs: int = 20000
+    debug: bool = False
+    debug_samples: int = 10000
 
 
 def _select_view_indices(num_views: int, total_views: int) -> np.ndarray:
@@ -113,7 +115,7 @@ def _sample_surface_points(
     depth_var: torch.Tensor,
     tex_grad: torch.Tensor,
     cfg: RSSVoxelConfig,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray]]:
     device = opacity.device
     h, w = opacity.shape
     total_pixels = h * w
@@ -125,6 +127,8 @@ def _sample_surface_points(
     max_attempts = 8
     points_world = []
     weights = []
+    debug_info: Dict[str, np.ndarray] = {}
+    debug_limit = cfg.debug_samples if cfg.debug else 0
 
     needed = cfg.pixels_per_view
     for _ in range(max_attempts):
@@ -160,12 +164,105 @@ def _sample_surface_points(
             weights.append(wts)
             needed -= keep
 
+            if debug_limit > 0:
+                dbg_keep = min(debug_limit, keep)
+                dbg_idx = valid_idx[:dbg_keep]
+                debug_info.setdefault("u", []).append((dbg_idx % w).float())
+                debug_info.setdefault("v", []).append((dbg_idx // w).float())
+                debug_info.setdefault("depth", []).append(depth[:dbg_keep])
+                if var_flat is not None:
+                    debug_info.setdefault("var", []).append(var_flat[dbg_idx].float())
+                debug_limit -= dbg_keep
+
     if not points_world:
-        return np.zeros((0, 3), dtype=np.float32), np.zeros((0,), dtype=np.float32)
+        return np.zeros((0, 3), dtype=np.float32), np.zeros((0,), dtype=np.float32), {}
 
     pts = torch.cat(points_world, dim=0)
     wts = torch.cat(weights, dim=0)
-    return pts.detach().cpu().numpy().astype(np.float32), wts.detach().cpu().numpy().astype(np.float32)
+    debug_np: Dict[str, np.ndarray] = {}
+    if debug_info:
+        debug_np["u"] = torch.cat(debug_info["u"], dim=0).detach().cpu().numpy()
+        debug_np["v"] = torch.cat(debug_info["v"], dim=0).detach().cpu().numpy()
+        debug_np["depth"] = torch.cat(debug_info["depth"], dim=0).detach().cpu().numpy()
+        if "var" in debug_info:
+            debug_np["var"] = torch.cat(debug_info["var"], dim=0).detach().cpu().numpy()
+    return (
+        pts.detach().cpu().numpy().astype(np.float32),
+        wts.detach().cpu().numpy().astype(np.float32),
+        debug_np,
+    )
+
+
+def _debug_reprojection(view, debug_np: Dict[str, np.ndarray]) -> None:
+    if not debug_np:
+        print("[RSS][Debug] No debug samples available.")
+        return
+    u = torch.from_numpy(debug_np["u"]).float().cuda()
+    v = torch.from_numpy(debug_np["v"]).float().cuda()
+    depth = torch.from_numpy(debug_np["depth"]).float().cuda()
+    pts_world = _backproject(view, u, v, depth)
+
+    pts_view = geom_transform_points(pts_world, view.world_view_transform)
+    z = pts_view[:, 2]
+    fx = fov2focal(view.FoVx, view.image_width)
+    fy = fov2focal(view.FoVy, view.image_height)
+    cx = (view.image_width - 1) * 0.5
+    cy = (view.image_height - 1) * 0.5
+    eps = 1e-6
+    u_proj = fx * (pts_view[:, 0] / (z + eps)) + cx
+    v_proj = fy * (pts_view[:, 1] / (z + eps)) + cy
+    reproj_err = torch.sqrt((u_proj - u) ** 2 + (v_proj - v) ** 2)
+
+    err = reproj_err.detach().cpu().numpy()
+    z_cpu = z.detach().cpu().numpy()
+    depth_cpu = depth.detach().cpu().numpy()
+    ratio = z_cpu / (depth_cpu + 1e-6)
+
+    print(
+        "[RSS][Debug] Reproj err px: mean={:.3f} med={:.3f} p95={:.3f} max={:.3f}".format(
+            float(np.mean(err)),
+            float(np.median(err)),
+            float(np.percentile(err, 95)),
+            float(np.max(err)),
+        )
+    )
+    print(
+        "[RSS][Debug] Depth sign: z<=0 {:.2f}% depth<=0 {:.2f}%".format(
+            100.0 * float(np.mean(z_cpu <= 0)),
+            100.0 * float(np.mean(depth_cpu <= 0)),
+        )
+    )
+    print(
+        "[RSS][Debug] z/depth ratio: med={:.4f} p05={:.4f} p95={:.4f}".format(
+            float(np.median(ratio)),
+            float(np.percentile(ratio, 5)),
+            float(np.percentile(ratio, 95)),
+        )
+    )
+    print(
+        "[RSS][Debug] depth_hit stats: min={:.4f} med={:.4f} max={:.4f}".format(
+            float(np.min(depth_cpu)),
+            float(np.median(depth_cpu)),
+            float(np.max(depth_cpu)),
+        )
+    )
+    if "var" in debug_np:
+        var = np.maximum(debug_np["var"], 0.0)
+        std_ratio = np.sqrt(var) / (np.abs(depth_cpu) + 1e-6)
+        print(
+            "[RSS][Debug] depth_var stats: min={:.6f} med={:.6f} max={:.6f}".format(
+                float(np.min(var)),
+                float(np.median(var)),
+                float(np.max(var)),
+            )
+        )
+        print(
+            "[RSS][Debug] sqrt(var)/|depth|: med={:.4f} p95={:.4f} max={:.4f}".format(
+                float(np.median(std_ratio)),
+                float(np.percentile(std_ratio, 95)),
+                float(np.max(std_ratio)),
+            )
+        )
 
 
 def _filter_points(
@@ -345,13 +442,20 @@ def build_student_from_rss_voxel(
                 tex_grad = tex_grad * view.alpha_mask[0].to(tex_grad.device)
 
         t0 = time.time()
-        pts, wts = _sample_surface_points(view, alpha, depth_hit, depth_var, tex_grad, cfg)
+        debug_before = cfg.debug
+        if debug_before and "debug_done" in timings:
+            cfg.debug = False
+        pts, wts, debug_np = _sample_surface_points(view, alpha, depth_hit, depth_var, tex_grad, cfg)
+        cfg.debug = debug_before
         sample_time += time.time() - t0
 
         if pts.shape[0] == 0:
             continue
         points_list.append(pts)
         weights_list.append(wts)
+        if cfg.debug and debug_np and "debug_done" not in timings:
+            _debug_reprojection(view, debug_np)
+            timings["debug_done"] = 1.0
 
     timings["render_sampling"] = render_time + sample_time
 

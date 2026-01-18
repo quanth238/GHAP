@@ -56,7 +56,7 @@ else
 fi
 
 # training
-CUDA_VISIBLE_DEVICES=0 python train_and_prune.py \
+CUDA_VISIBLE_DEVICES=3 python train_and_prune.py \
     -s "$source_path" \
     -m "$directory1" \
     --sampling_ratio $sampling_ratio \
@@ -64,14 +64,13 @@ CUDA_VISIBLE_DEVICES=0 python train_and_prune.py \
     --compact \
     --disable_viewer \
     $ckpt_flag \
-    --iterations 35000 \
-    --test_iterations 30001 30002 35000 \
-    --save_iterations 35000 \
-    --checkpoint_iterations 35000 \
-    --sampling_iter 30001 \
+    --iterations 30000 \
+    --test_iterations 15001 15002 30000 \
+    --save_iterations 30000 \
+    --checkpoint_iterations 15000 \
+    --sampling_iter 15001 \
     "${extra_args[@]}"
 
 # render & evaluate
-python render.py -m "$directory1"
-python metrics.py -m "$directory1"
-
+CUDA_VISIBLE_DEVICES=3 python render.py -m "$directory1"
+CUDA_VISIBLE_DEVICES=3 python metrics.py -m "$directory1"
