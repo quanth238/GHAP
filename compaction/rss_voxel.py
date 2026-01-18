@@ -1,5 +1,6 @@
 import time
 import math
+import heapq
 from dataclasses import dataclass
 from typing import Dict, Tuple
 
@@ -32,6 +33,7 @@ class RSSVoxelConfig:
     depth_gate: bool
     seed: int
     center_mode: str = "mean"
+    teacher_selector: str = "voxel"
     world_bound_scale: float = 4.0
     bbox_percentiles: Tuple[float, float] = (1.0, 99.0)
     min_centers_frac: float = 0.7
@@ -488,6 +490,123 @@ def _select_teacher_ids(
     return selected.astype(np.int64), voxel_size, stats
 
 
+def _select_teacher_ids_octree(
+    teacher_xyz: np.ndarray,
+    mass: np.ndarray,
+    cfg: RSSVoxelConfig,
+) -> Tuple[np.ndarray, float, Dict[str, float]]:
+    if teacher_xyz.shape[0] == 0:
+        raise ValueError("Teacher has 0 Gaussians.")
+
+    mass = np.nan_to_num(mass, nan=0.0, posinf=0.0, neginf=0.0)
+    active_mask = mass > 0
+    if np.any(active_mask):
+        root_indices = np.flatnonzero(active_mask)
+        xyz_for_voxel = teacher_xyz[active_mask]
+    else:
+        root_indices = np.arange(teacher_xyz.shape[0], dtype=np.int64)
+        xyz_for_voxel = teacher_xyz
+
+    min_xyz = xyz_for_voxel.min(axis=0)
+    max_xyz = xyz_for_voxel.max(axis=0)
+    if cfg.voxel_search:
+        voxel_size = _search_voxel_size(
+            xyz_for_voxel, min_xyz, max_xyz, cfg.target_num_gaussians, cfg.voxel_search_iters
+        )
+    else:
+        if cfg.voxel_size <= 0:
+            raise ValueError("rss_voxel_size must be > 0 when voxel search is disabled.")
+        voxel_size = cfg.voxel_size
+
+    heap: list = []
+    node_id = 0
+    root_mass = float(mass[root_indices].sum())
+    heapq.heappush(heap, (-root_mass, node_id, root_indices, min_xyz, max_xyz))
+    leaf_count = 1
+    final_leaves = []
+
+    while leaf_count < cfg.target_num_gaussians and heap:
+        neg_mass, _, indices, bmin, bmax = heapq.heappop(heap)
+        if indices.size <= 1:
+            final_leaves.append((neg_mass, indices))
+            continue
+
+        center = 0.5 * (bmin + bmax)
+        pts = teacher_xyz[indices]
+        bits = (pts >= center).astype(np.int8)
+        octant = (bits[:, 0] * 4 + bits[:, 1] * 2 + bits[:, 2]).astype(np.int8)
+
+        children_added = 0
+        for i in range(8):
+            mask = octant == i
+            if not np.any(mask):
+                continue
+            child_indices = indices[mask]
+            child_mass = float(mass[child_indices].sum())
+            if child_mass <= 0.0:
+                continue
+
+            child_bmin = bmin.copy()
+            child_bmax = bmax.copy()
+            if i & 4:
+                child_bmin[0] = center[0]
+            else:
+                child_bmax[0] = center[0]
+            if i & 2:
+                child_bmin[1] = center[1]
+            else:
+                child_bmax[1] = center[1]
+            if i & 1:
+                child_bmin[2] = center[2]
+            else:
+                child_bmax[2] = center[2]
+
+            node_id += 1
+            heapq.heappush(heap, (-child_mass, node_id, child_indices, child_bmin, child_bmax))
+            children_added += 1
+
+        if children_added <= 1:
+            final_leaves.append((neg_mass, indices))
+            continue
+
+        leaf_count += children_added - 1
+
+    leaves = final_leaves + [(neg_mass, indices) for (neg_mass, _, indices, _, _) in heap]
+    selected = []
+    leaf_masses = []
+    for neg_mass, indices in leaves:
+        if indices.size == 0:
+            continue
+        local_mass = mass[indices]
+        if local_mass.size == 0:
+            continue
+        best_local = indices[int(np.argmax(local_mass))]
+        selected.append(best_local)
+        leaf_masses.append(-neg_mass)
+
+    selected = np.asarray(selected, dtype=np.int64)
+    leaf_masses = np.asarray(leaf_masses, dtype=np.float32)
+    stats = {"leaf_count": float(selected.shape[0])}
+
+    if selected.shape[0] > cfg.target_num_gaussians:
+        before = selected.shape[0]
+        keep = np.argpartition(leaf_masses, -cfg.target_num_gaussians)[-cfg.target_num_gaussians:]
+        selected = selected[keep]
+        stats["trimmed"] = float(before - selected.shape[0])
+    elif selected.shape[0] < cfg.target_num_gaussians:
+        selected_mask = np.zeros(teacher_xyz.shape[0], dtype=bool)
+        selected_mask[selected] = True
+        order_global = np.lexsort((np.arange(teacher_xyz.shape[0]), -mass))
+        remaining = order_global[~selected_mask[order_global]]
+        need = cfg.target_num_gaussians - selected.shape[0]
+        if remaining.size > need:
+            remaining = remaining[:need]
+        selected = np.concatenate([selected, remaining], axis=0)
+        stats["filled"] = float(need)
+
+    return selected.astype(np.int64), voxel_size, stats
+
+
 def build_student_from_rss_voxel(
     gaussians,
     scene,
@@ -556,11 +675,15 @@ def build_student_from_rss_voxel(
             raise RuntimeError("Teacher-space resampling collected 0 mass across views.")
 
         t0 = time.time()
-        selected_ids, voxel_size, sel_stats = _select_teacher_ids(teacher_xyz, mass, cfg)
+        if cfg.teacher_selector == "octree":
+            selected_ids, voxel_size, sel_stats = _select_teacher_ids_octree(teacher_xyz, mass, cfg)
+        else:
+            selected_ids, voxel_size, sel_stats = _select_teacher_ids(teacher_xyz, mass, cfg)
         centers = teacher_xyz[selected_ids]
         timings["num_centers"] = float(centers.shape[0])
         timings["voxel"] = time.time() - t0
         timings["teacher_voxels"] = sel_stats.get("voxel_count", 0.0)
+        timings["teacher_leaves"] = sel_stats.get("leaf_count", 0.0)
         if cfg.snap_to_teacher or cfg.snap_unique:
             print("[RSS] Warning: teacher-space resampling ignores snapping options.")
         if centers.shape[0] < cfg.target_num_gaussians:
@@ -750,14 +873,20 @@ def build_student_from_rss_voxel(
                     f"[RSS] Snap unique: centers={centers.shape[0]} < target {cfg.target_num_gaussians}."
                 )
 
-    if cfg.debug:
-        print(
-            "[RSS][Debug] Center mode: {} voxel_size={:.6f} centers={}".format(
-                cfg.center_mode,
-                float(voxel_size),
-                int(centers.shape[0]),
+        if cfg.debug:
+            print(
+                "[RSS][Debug] Center mode: {} voxel_size={:.6f} centers={}".format(
+                    cfg.center_mode,
+                    float(voxel_size),
+                    int(centers.shape[0]),
+                )
             )
-        )
+            if cfg.center_mode == "teacher":
+                print(
+                    "[RSS][Debug] Teacher selector: {}".format(
+                        cfg.teacher_selector
+                    )
+                )
         dist = dist.astype(np.float32)
         if dist.size > 0:
             print(

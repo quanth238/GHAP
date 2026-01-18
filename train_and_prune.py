@@ -238,6 +238,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             hit_quantile=compaction.rss_hit_quantile,
                             depth_var_thresh=compaction.rss_depth_var_thresh,
                             center_mode=compaction.rss_center_mode,
+                            teacher_selector=compaction.rss_teacher_selector,
                             voxel_search=compaction.rss_voxel_search,
                             voxel_search_iters=compaction.rss_voxel_search_iters,
                             voxel_size=compaction.rss_voxel_size,
@@ -477,6 +478,7 @@ if __name__ == "__main__":
     parser.add_argument("--rss_hit_quantile", type=float, default=0.7)
     parser.add_argument("--rss_depth_var_thresh", type=float, default=0.01)
     parser.add_argument("--rss_center_mode", type=str, default="mean", choices=["mean", "representative", "teacher"])
+    parser.add_argument("--rss_teacher_selector", type=str, default="voxel", choices=["voxel", "octree"])
     parser.add_argument("--rss_debug", action="store_true", default=False)
     parser.add_argument("--rss_debug_samples", type=int, default=10000)
     parser.add_argument("--rss_snap_to_teacher", action="store_true", default=False)
@@ -518,6 +520,7 @@ if __name__ == "__main__":
             rss_hit_quantile,
             rss_depth_var_thresh,
             rss_center_mode,
+            rss_teacher_selector,
             rss_debug,
             rss_debug_samples,
             rss_snap_to_teacher,
@@ -548,6 +551,7 @@ if __name__ == "__main__":
             self.rss_hit_quantile = rss_hit_quantile
             self.rss_depth_var_thresh = rss_depth_var_thresh
             self.rss_center_mode = rss_center_mode
+            self.rss_teacher_selector = rss_teacher_selector
             self.rss_debug = rss_debug
             self.rss_debug_samples = rss_debug_samples
             self.rss_snap_to_teacher = rss_snap_to_teacher
@@ -576,6 +580,7 @@ if __name__ == "__main__":
         args.rss_hit_quantile,
         args.rss_depth_var_thresh,
         args.rss_center_mode,
+        args.rss_teacher_selector,
         args.rss_debug,
         args.rss_debug_samples,
         args.rss_snap_to_teacher,
