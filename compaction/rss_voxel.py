@@ -31,6 +31,7 @@ class RSSVoxelConfig:
     voxel_size: float
     depth_gate: bool
     seed: int
+    center_mode: str = "mean"
     world_bound_scale: float = 4.0
     bbox_percentiles: Tuple[float, float] = (1.0, 99.0)
     min_centers_frac: float = 0.7
@@ -338,6 +339,24 @@ def _voxelize(points: np.ndarray, weights: np.ndarray, min_xyz: np.ndarray, voxe
     return centers.astype(np.float32), mass.astype(np.float32)
 
 
+def _voxel_representative(
+    points: np.ndarray, weights: np.ndarray, min_xyz: np.ndarray, voxel_size: float
+) -> Tuple[np.ndarray, np.ndarray]:
+    coords = np.floor((points - min_xyz) / voxel_size).astype(np.int64)
+    order = np.lexsort((-weights, coords[:, 2], coords[:, 1], coords[:, 0]))
+    coords_sorted = coords[order]
+    points_sorted = points[order]
+    weights_sorted = weights[order]
+    if coords_sorted.shape[0] == 0:
+        return points_sorted.astype(np.float32), weights_sorted.astype(np.float32)
+
+    is_new = np.ones(coords_sorted.shape[0], dtype=bool)
+    is_new[1:] = np.any(coords_sorted[1:] != coords_sorted[:-1], axis=1)
+    centers = points_sorted[is_new]
+    rep_weights = weights_sorted[is_new]
+    return centers.astype(np.float32), rep_weights.astype(np.float32)
+
+
 def _voxel_count(points: np.ndarray, min_xyz: np.ndarray, voxel_size: float) -> int:
     coords = np.floor((points - min_xyz) / voxel_size).astype(np.int64)
     coords_view = coords.view([("", coords.dtype)] * 3).reshape(-1)
@@ -390,12 +409,20 @@ def _select_centers(points: np.ndarray, weights: np.ndarray, cfg: RSSVoxelConfig
             raise ValueError("rss_voxel_size must be > 0 when voxel search is disabled.")
         voxel_size = cfg.voxel_size
 
-    centers, mass = _voxelize(points, weights, min_xyz, voxel_size)
+    if cfg.center_mode == "mean":
+        centers, mass = _voxelize(points, weights, min_xyz, voxel_size)
+    elif cfg.center_mode == "representative":
+        centers, mass = _voxel_representative(points, weights, min_xyz, voxel_size)
+    else:
+        raise ValueError(f"Unknown rss_center_mode: {cfg.center_mode}")
 
     if centers.shape[0] < cfg.target_num_gaussians and cfg.voxel_search:
         for _ in range(4):
             voxel_size *= 0.5
-            centers, mass = _voxelize(points, weights, min_xyz, voxel_size)
+            if cfg.center_mode == "mean":
+                centers, mass = _voxelize(points, weights, min_xyz, voxel_size)
+            else:
+                centers, mass = _voxel_representative(points, weights, min_xyz, voxel_size)
             if centers.shape[0] >= cfg.target_num_gaussians:
                 break
     if centers.shape[0] > cfg.target_num_gaussians:
@@ -403,6 +430,62 @@ def _select_centers(points: np.ndarray, weights: np.ndarray, cfg: RSSVoxelConfig
         centers = centers[keep]
 
     return centers.astype(np.float32), voxel_size
+
+
+def _select_teacher_ids(
+    teacher_xyz: np.ndarray,
+    mass: np.ndarray,
+    cfg: RSSVoxelConfig,
+) -> Tuple[np.ndarray, float, Dict[str, float]]:
+    if teacher_xyz.shape[0] == 0:
+        raise ValueError("Teacher has 0 Gaussians.")
+
+    mass = np.nan_to_num(mass, nan=0.0, posinf=0.0, neginf=0.0)
+    active_mask = mass > 0
+    xyz_for_voxel = teacher_xyz[active_mask] if np.any(active_mask) else teacher_xyz
+    min_xyz = xyz_for_voxel.min(axis=0)
+    max_xyz = xyz_for_voxel.max(axis=0)
+    if cfg.voxel_search:
+        voxel_size = _search_voxel_size(
+            xyz_for_voxel, min_xyz, max_xyz, cfg.target_num_gaussians, cfg.voxel_search_iters
+        )
+    else:
+        if cfg.voxel_size <= 0:
+            raise ValueError("rss_voxel_size must be > 0 when voxel search is disabled.")
+        voxel_size = cfg.voxel_size
+
+    coords = np.floor((teacher_xyz - min_xyz) / voxel_size).astype(np.int64)
+    order = np.lexsort((-mass, coords[:, 2], coords[:, 1], coords[:, 0]))
+    coords_sorted = coords[order]
+    mass_sorted = mass[order]
+
+    is_new = np.ones(coords_sorted.shape[0], dtype=bool)
+    is_new[1:] = np.any(coords_sorted[1:] != coords_sorted[:-1], axis=1)
+    base_mask = is_new & (mass_sorted > 0)
+    base_ids = order[base_mask]
+    stats = {
+        "voxel_count": float(is_new.sum()),
+        "base_count": float(base_ids.shape[0]),
+    }
+
+    selected = base_ids
+    if selected.shape[0] > cfg.target_num_gaussians:
+        base_mass = mass[selected]
+        keep = np.argpartition(base_mass, -cfg.target_num_gaussians)[-cfg.target_num_gaussians:]
+        selected = selected[keep]
+        stats["trimmed"] = float(base_ids.shape[0] - selected.shape[0])
+    elif selected.shape[0] < cfg.target_num_gaussians:
+        selected_mask = np.zeros(teacher_xyz.shape[0], dtype=bool)
+        selected_mask[selected] = True
+        order_global = np.lexsort((np.arange(teacher_xyz.shape[0]), -mass))
+        remaining = order_global[~selected_mask[order_global]]
+        need = cfg.target_num_gaussians - selected.shape[0]
+        if remaining.size > need:
+            remaining = remaining[:need]
+        selected = np.concatenate([selected, remaining], axis=0)
+        stats["filled"] = float(need)
+
+    return selected.astype(np.int64), voxel_size, stats
 
 
 def build_student_from_rss_voxel(
@@ -424,168 +507,257 @@ def build_student_from_rss_voxel(
     cams = scene.getTrainCameras().copy()
     view_indices = _select_view_indices(cfg.num_views, len(cams))
 
-    points_list = []
-    weights_list = []
-    render_time = 0.0
-    sample_time = 0.0
-
-    for idx in view_indices:
-        view = cams[int(idx)]
-        t0 = time.time()
-        render_pkg = _render_stats(view, gaussians, pipe, separate_sh, cfg.hit_quantile)
-        render_time += time.time() - t0
-
-        alpha = render_pkg["opacity"]
-        depth_hit = render_pkg["depth_hit"]
-        depth_var = render_pkg["depth_var"]
-
-        if view.alpha_mask is not None:
-            alpha = alpha * view.alpha_mask[0].to(alpha.device)
-
-        tex_grad = None
-        if cfg.lambda_tex > 0:
-            tex_grad = _compute_texture_grad(view.original_image.to(alpha.device))
-            if view.alpha_mask is not None:
-                tex_grad = tex_grad * view.alpha_mask[0].to(tex_grad.device)
-
-        t0 = time.time()
-        debug_before = cfg.debug
-        if debug_before and "debug_done" in timings:
-            cfg.debug = False
-        pts, wts, debug_np = _sample_surface_points(view, alpha, depth_hit, depth_var, tex_grad, cfg)
-        cfg.debug = debug_before
-        sample_time += time.time() - t0
-
-        if pts.shape[0] == 0:
-            continue
-        points_list.append(pts)
-        weights_list.append(wts)
-        if cfg.debug and debug_np and "debug_done" not in timings:
-            _debug_reprojection(view, debug_np)
-            timings["debug_done"] = 1.0
-
-    timings["render_sampling"] = render_time + sample_time
-
-    if not points_list:
-        raise RuntimeError("RSS sampling collected 0 points across views.")
-
-    points = np.concatenate(points_list, axis=0)
-    weights = np.concatenate(weights_list, axis=0)
-    timings["num_samples_raw"] = float(points.shape[0])
-
-    points, weights, filter_stats = _filter_points(points, weights, scene.cameras_extent, cfg)
-    timings["num_samples"] = float(points.shape[0])
-    if filter_stats["kept"] < filter_stats["raw"]:
-        print(
-            "[RSS] Filtered samples: raw={:.0f} kept={:.0f} dropped_bound={:.0f} "
-            "dropped_percentile={:.0f}".format(
-                filter_stats["raw"],
-                filter_stats["kept"],
-                filter_stats["dropped_bound"],
-                filter_stats["dropped_percentile"],
-            )
-        )
-
-    if points.shape[0] == 0:
-        raise RuntimeError("RSS sampling produced 0 valid points after filtering.")
-
-    if points.shape[0] < 4 * cfg.target_num_gaussians:
-        print(
-            f"[RSS] Warning: M={points.shape[0]} is < 4*K={4 * cfg.target_num_gaussians}. "
-            "Consider increasing rss_num_views or rss_pixels_per_view."
-        )
-
-    t0 = time.time()
-    centers, voxel_size = _select_centers(points, weights, cfg)
-    timings["num_centers"] = float(centers.shape[0])
-    timings["voxel"] = time.time() - t0
-    if centers.shape[0] < cfg.target_num_gaussians:
-        print(
-            f"[RSS] Warning: voxelization produced K={centers.shape[0]} < target {cfg.target_num_gaussians}. "
-            "Consider decreasing voxel size or increasing rss_voxel_search_iters."
-        )
-    min_allowed = max(
-        int(cfg.target_num_gaussians * cfg.min_centers_frac),
-        cfg.min_centers_abs,
-    )
-    if centers.shape[0] < min_allowed:
-        timings["skip_reason"] = "low_centers"
-        timings["min_centers_allowed"] = float(min_allowed)
-        print(
-            f"[RSS] Abort compaction: centers={centers.shape[0]} < min_allowed={min_allowed}. "
-            "Keeping teacher."
-        )
-        return None, timings
-
-    t0 = time.time()
-    teacher_xyz = gaussians.get_xyz.detach().cpu().numpy()
-    if cKDTree is None:
-        raise RuntimeError("SciPy not available for KD-tree search.")
-    tree = cKDTree(teacher_xyz)
-    dist, nn_idx = tree.query(centers, k=1, workers=-1)
-    timings["kdtree"] = time.time() - t0
-
+    use_teacher_resample = cfg.center_mode == "teacher"
+    teacher_xyz = None
+    tree = None
     unique_teacher = None
-    if cfg.snap_to_teacher:
-        sample_n = min(200000, teacher_xyz.shape[0])
-        sample_idx = np.random.choice(teacher_xyz.shape[0], size=sample_n, replace=False)
-        tdist, _ = tree.query(teacher_xyz[sample_idx], k=2, workers=-1)
-        nn_dist = tdist[:, 1] if tdist.size > 0 else np.array([], dtype=np.float32)
-        med_nn = float(np.median(nn_dist)) if nn_dist.size > 0 else 0.0
-        snap_thresh = max(cfg.snap_min, cfg.snap_factor * med_nn)
-        snap_mask = dist > snap_thresh
-        if snap_mask.any():
-            centers[snap_mask] = teacher_xyz[nn_idx[snap_mask]]
-        print(
-            "[RSS] Snap centers: thresh={:.6f} med_nn={:.6f} snapped={}/{}".format(
-                snap_thresh,
-                med_nn,
-                int(snap_mask.sum()),
-                centers.shape[0],
-            )
-        )
-        unique_teacher = np.unique(nn_idx).shape[0]
-        # Recompute NN distances after snapping for accurate debug.
-        dist, nn_idx = tree.query(centers, k=1, workers=-1)
 
-    if cfg.snap_unique:
-        order = np.argsort(dist)
-        used = np.zeros(teacher_xyz.shape[0], dtype=bool)
-        keep_idx = []
-        for idx in order:
-            tid = nn_idx[idx]
-            if not used[tid]:
-                used[tid] = True
-                keep_idx.append(idx)
-                if len(keep_idx) >= cfg.target_num_gaussians:
-                    break
-        centers_kept = centers[np.array(keep_idx, dtype=np.int64)]
-        nn_idx_kept = nn_idx[np.array(keep_idx, dtype=np.int64)]
-        dist_kept = dist[np.array(keep_idx, dtype=np.int64)]
+    if use_teacher_resample:
+        teacher_xyz = gaussians.get_xyz.detach().cpu().numpy()
+        mass = np.zeros((teacher_xyz.shape[0],), dtype=np.float32)
+        render_time = 0.0
+        num_valid = 0
 
-        if centers_kept.shape[0] < cfg.target_num_gaussians and cfg.snap_fill_teacher:
-            unused = np.flatnonzero(~used)
-            needed = cfg.target_num_gaussians - centers_kept.shape[0]
-            if unused.size == 0:
-                print("[RSS] Snap unique: no unused teacher ids to fill.")
-            else:
-                take = np.random.choice(unused, size=min(needed, unused.size), replace=False)
-                centers_extra = teacher_xyz[take]
-                centers = np.concatenate([centers_kept, centers_extra], axis=0)
-                nn_idx = np.concatenate([nn_idx_kept, take], axis=0)
-                dist = np.concatenate([dist_kept, np.zeros(centers_extra.shape[0], dtype=dist_kept.dtype)], axis=0)
-        else:
-            centers = centers_kept
-            nn_idx = nn_idx_kept
-            dist = dist_kept
+        for idx in view_indices:
+            view = cams[int(idx)]
+            t0 = time.time()
+            render_pkg = _render_stats(view, gaussians, pipe, separate_sh, cfg.hit_quantile)
+            render_time += time.time() - t0
 
-        unique_teacher = np.unique(nn_idx).shape[0]
+            sum_w = render_pkg["opacity"]
+            max_id = render_pkg["max_id"]
+            max_w = render_pkg["max_w"]
+
+            if view.alpha_mask is not None:
+                mask = view.alpha_mask[0].to(sum_w.device)
+                sum_w = sum_w * mask
+                max_w = max_w * mask
+
+            valid = torch.logical_and(max_id >= 0, sum_w > cfg.alpha_tau)
+            valid = torch.logical_and(valid, max_w > 0)
+            num_valid += int(valid.sum().item())
+
+            if valid.any():
+                if cfg.lambda_tex > 0:
+                    tex_grad = _compute_texture_grad(view.original_image.to(sum_w.device))
+                    if view.alpha_mask is not None:
+                        tex_grad = tex_grad * mask
+                    weights = max_w[valid] * (1.0 + cfg.lambda_tex * tex_grad[valid])
+                else:
+                    weights = max_w[valid]
+                ids = max_id[valid].to(torch.int64)
+                counts = torch.bincount(ids, weights=weights, minlength=teacher_xyz.shape[0])
+                mass += counts.detach().cpu().numpy().astype(np.float32)
+
+        timings["render_sampling"] = render_time
+        timings["num_samples_raw"] = float(num_valid)
+        timings["num_samples"] = float(num_valid)
+        if mass.sum() <= 0:
+            raise RuntimeError("Teacher-space resampling collected 0 mass across views.")
+
+        t0 = time.time()
+        selected_ids, voxel_size, sel_stats = _select_teacher_ids(teacher_xyz, mass, cfg)
+        centers = teacher_xyz[selected_ids]
+        timings["num_centers"] = float(centers.shape[0])
+        timings["voxel"] = time.time() - t0
+        timings["teacher_voxels"] = sel_stats.get("voxel_count", 0.0)
+        if cfg.snap_to_teacher or cfg.snap_unique:
+            print("[RSS] Warning: teacher-space resampling ignores snapping options.")
         if centers.shape[0] < cfg.target_num_gaussians:
             print(
-                f"[RSS] Snap unique: centers={centers.shape[0]} < target {cfg.target_num_gaussians}."
+                f"[RSS] Warning: voxel selection produced K={centers.shape[0]} < target {cfg.target_num_gaussians}. "
+                "Consider decreasing voxel size or increasing rss_voxel_search_iters."
+            )
+        min_allowed = max(
+            int(cfg.target_num_gaussians * cfg.min_centers_frac),
+            cfg.min_centers_abs,
+        )
+        if centers.shape[0] < min_allowed:
+            timings["skip_reason"] = "low_centers"
+            timings["min_centers_allowed"] = float(min_allowed)
+            print(
+                f"[RSS] Abort compaction: centers={centers.shape[0]} < min_allowed={min_allowed}. "
+                "Keeping teacher."
+            )
+            return None, timings
+
+        nn_idx = selected_ids
+        dist = np.zeros_like(nn_idx, dtype=np.float32)
+        timings["kdtree"] = 0.0
+        unique_teacher = centers.shape[0]
+        if cfg.debug and cKDTree is not None:
+            tree = cKDTree(teacher_xyz)
+    else:
+        points_list = []
+        weights_list = []
+        render_time = 0.0
+        sample_time = 0.0
+
+        for idx in view_indices:
+            view = cams[int(idx)]
+            t0 = time.time()
+            render_pkg = _render_stats(view, gaussians, pipe, separate_sh, cfg.hit_quantile)
+            render_time += time.time() - t0
+
+            alpha = render_pkg["opacity"]
+            depth_hit = render_pkg["depth_hit"]
+            depth_var = render_pkg["depth_var"]
+
+            if view.alpha_mask is not None:
+                alpha = alpha * view.alpha_mask[0].to(alpha.device)
+
+            tex_grad = None
+            if cfg.lambda_tex > 0:
+                tex_grad = _compute_texture_grad(view.original_image.to(alpha.device))
+                if view.alpha_mask is not None:
+                    tex_grad = tex_grad * view.alpha_mask[0].to(tex_grad.device)
+
+            t0 = time.time()
+            debug_before = cfg.debug
+            if debug_before and "debug_done" in timings:
+                cfg.debug = False
+            pts, wts, debug_np = _sample_surface_points(view, alpha, depth_hit, depth_var, tex_grad, cfg)
+            cfg.debug = debug_before
+            sample_time += time.time() - t0
+
+            if pts.shape[0] == 0:
+                continue
+            points_list.append(pts)
+            weights_list.append(wts)
+            if cfg.debug and debug_np and "debug_done" not in timings:
+                _debug_reprojection(view, debug_np)
+                timings["debug_done"] = 1.0
+
+        timings["render_sampling"] = render_time + sample_time
+
+        if not points_list:
+            raise RuntimeError("RSS sampling collected 0 points across views.")
+
+        points = np.concatenate(points_list, axis=0)
+        weights = np.concatenate(weights_list, axis=0)
+        timings["num_samples_raw"] = float(points.shape[0])
+
+        points, weights, filter_stats = _filter_points(points, weights, scene.cameras_extent, cfg)
+        timings["num_samples"] = float(points.shape[0])
+        if filter_stats["kept"] < filter_stats["raw"]:
+            print(
+                "[RSS] Filtered samples: raw={:.0f} kept={:.0f} dropped_bound={:.0f} "
+                "dropped_percentile={:.0f}".format(
+                    filter_stats["raw"],
+                    filter_stats["kept"],
+                    filter_stats["dropped_bound"],
+                    filter_stats["dropped_percentile"],
+                )
             )
 
+        if points.shape[0] == 0:
+            raise RuntimeError("RSS sampling produced 0 valid points after filtering.")
+
+        if points.shape[0] < 4 * cfg.target_num_gaussians:
+            print(
+                f"[RSS] Warning: M={points.shape[0]} is < 4*K={4 * cfg.target_num_gaussians}. "
+                "Consider increasing rss_num_views or rss_pixels_per_view."
+            )
+
+        t0 = time.time()
+        centers, voxel_size = _select_centers(points, weights, cfg)
+        timings["num_centers"] = float(centers.shape[0])
+        timings["voxel"] = time.time() - t0
+        if cfg.center_mode == "representative" and (cfg.snap_to_teacher or cfg.snap_unique):
+            print("[RSS] Warning: representative centers with snapping may reduce coverage.")
+        if centers.shape[0] < cfg.target_num_gaussians:
+            print(
+                f"[RSS] Warning: voxelization produced K={centers.shape[0]} < target {cfg.target_num_gaussians}. "
+                "Consider decreasing voxel size or increasing rss_voxel_search_iters."
+            )
+        min_allowed = max(
+            int(cfg.target_num_gaussians * cfg.min_centers_frac),
+            cfg.min_centers_abs,
+        )
+        if centers.shape[0] < min_allowed:
+            timings["skip_reason"] = "low_centers"
+            timings["min_centers_allowed"] = float(min_allowed)
+            print(
+                f"[RSS] Abort compaction: centers={centers.shape[0]} < min_allowed={min_allowed}. "
+                "Keeping teacher."
+            )
+            return None, timings
+
+        t0 = time.time()
+        teacher_xyz = gaussians.get_xyz.detach().cpu().numpy()
+        if cKDTree is None:
+            raise RuntimeError("SciPy not available for KD-tree search.")
+        tree = cKDTree(teacher_xyz)
+        dist, nn_idx = tree.query(centers, k=1, workers=-1)
+        timings["kdtree"] = time.time() - t0
+
+        if cfg.snap_to_teacher:
+            sample_n = min(200000, teacher_xyz.shape[0])
+            sample_idx = np.random.choice(teacher_xyz.shape[0], size=sample_n, replace=False)
+            tdist, _ = tree.query(teacher_xyz[sample_idx], k=2, workers=-1)
+            nn_dist = tdist[:, 1] if tdist.size > 0 else np.array([], dtype=np.float32)
+            med_nn = float(np.median(nn_dist)) if nn_dist.size > 0 else 0.0
+            snap_thresh = max(cfg.snap_min, cfg.snap_factor * med_nn)
+            snap_mask = dist > snap_thresh
+            if snap_mask.any():
+                centers[snap_mask] = teacher_xyz[nn_idx[snap_mask]]
+            print(
+                "[RSS] Snap centers: thresh={:.6f} med_nn={:.6f} snapped={}/{}".format(
+                    snap_thresh,
+                    med_nn,
+                    int(snap_mask.sum()),
+                    centers.shape[0],
+                )
+            )
+            unique_teacher = np.unique(nn_idx).shape[0]
+            # Recompute NN distances after snapping for accurate debug.
+            dist, nn_idx = tree.query(centers, k=1, workers=-1)
+
+        if cfg.snap_unique:
+            order = np.argsort(dist)
+            used = np.zeros(teacher_xyz.shape[0], dtype=bool)
+            keep_idx = []
+            for idx in order:
+                tid = nn_idx[idx]
+                if not used[tid]:
+                    used[tid] = True
+                    keep_idx.append(idx)
+                    if len(keep_idx) >= cfg.target_num_gaussians:
+                        break
+            centers_kept = centers[np.array(keep_idx, dtype=np.int64)]
+            nn_idx_kept = nn_idx[np.array(keep_idx, dtype=np.int64)]
+            dist_kept = dist[np.array(keep_idx, dtype=np.int64)]
+
+            if centers_kept.shape[0] < cfg.target_num_gaussians and cfg.snap_fill_teacher:
+                unused = np.flatnonzero(~used)
+                needed = cfg.target_num_gaussians - centers_kept.shape[0]
+                if unused.size == 0:
+                    print("[RSS] Snap unique: no unused teacher ids to fill.")
+                else:
+                    take = np.random.choice(unused, size=min(needed, unused.size), replace=False)
+                    centers_extra = teacher_xyz[take]
+                    centers = np.concatenate([centers_kept, centers_extra], axis=0)
+                    nn_idx = np.concatenate([nn_idx_kept, take], axis=0)
+                    dist = np.concatenate([dist_kept, np.zeros(centers_extra.shape[0], dtype=dist_kept.dtype)], axis=0)
+            else:
+                centers = centers_kept
+                nn_idx = nn_idx_kept
+                dist = dist_kept
+
+            unique_teacher = np.unique(nn_idx).shape[0]
+            if centers.shape[0] < cfg.target_num_gaussians:
+                print(
+                    f"[RSS] Snap unique: centers={centers.shape[0]} < target {cfg.target_num_gaussians}."
+                )
+
     if cfg.debug:
+        print(
+            "[RSS][Debug] Center mode: {} voxel_size={:.6f} centers={}".format(
+                cfg.center_mode,
+                float(voxel_size),
+                int(centers.shape[0]),
+            )
+        )
         dist = dist.astype(np.float32)
         if dist.size > 0:
             print(
@@ -602,27 +774,30 @@ def build_student_from_rss_voxel(
                     int(centers.shape[0]),
                 )
             )
-        sample_n = min(200000, teacher_xyz.shape[0])
-        sample_idx = np.random.choice(teacher_xyz.shape[0], size=sample_n, replace=False)
-        tdist, _ = tree.query(teacher_xyz[sample_idx], k=2, workers=-1)
-        if tdist.size > 0:
-            nn_dist = tdist[:, 1]
-            print(
-                "[RSS][Debug] NN distance teacher->teacher: med={:.6f} p95={:.6f} max={:.6f}".format(
-                    float(np.median(nn_dist)),
-                    float(np.percentile(nn_dist, 95)),
-                    float(np.max(nn_dist)),
+        if tree is None:
+            print("[RSS][Debug] KD-tree unavailable; skipping teacher distance stats.")
+        else:
+            sample_n = min(200000, teacher_xyz.shape[0])
+            sample_idx = np.random.choice(teacher_xyz.shape[0], size=sample_n, replace=False)
+            tdist, _ = tree.query(teacher_xyz[sample_idx], k=2, workers=-1)
+            if tdist.size > 0:
+                nn_dist = tdist[:, 1]
+                print(
+                    "[RSS][Debug] NN distance teacher->teacher: med={:.6f} p95={:.6f} max={:.6f}".format(
+                        float(np.median(nn_dist)),
+                        float(np.percentile(nn_dist, 95)),
+                        float(np.max(nn_dist)),
+                    )
                 )
-            )
-        tdist2, _ = tree.query(teacher_xyz, k=1, workers=-1)
-        if tdist2.size > 0:
-            print(
-                "[RSS][Debug] Teacher->center coverage: med={:.6f} p95={:.6f} max={:.6f}".format(
-                    float(np.median(tdist2)),
-                    float(np.percentile(tdist2, 95)),
-                    float(np.max(tdist2)),
+            tdist2, _ = tree.query(teacher_xyz, k=1, workers=-1)
+            if tdist2.size > 0:
+                print(
+                    "[RSS][Debug] Teacher->center coverage: med={:.6f} p95={:.6f} max={:.6f}".format(
+                        float(np.median(tdist2)),
+                        float(np.percentile(tdist2, 95)),
+                        float(np.max(tdist2)),
+                    )
                 )
-            )
         print(f"[RSS][Debug] scene.cameras_extent={scene.cameras_extent:.6f}")
 
     device = gaussians.get_xyz.device

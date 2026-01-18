@@ -112,7 +112,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             cov3D_precomp = cov3D_precomp)
 
     if return_stats:
-        rendered_image, radii, depth_image, sum_w, sum_wz, sum_wz2, hit_depth, max_id = outputs
+        rendered_image, radii, depth_image, sum_w, sum_wz, sum_wz2, hit_depth, max_w, max_id = outputs
     else:
         rendered_image, radii, depth_image = outputs
         
@@ -140,12 +140,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         mean_z = sum_wz / (sum_w + eps)
         var_z = sum_wz2 / (sum_w + eps) - mean_z * mean_z
         var_z = torch.clamp(var_z, min=0.0)
+        max_w = max_w[0]
         max_id = max_id[0]
         out.update({
             "opacity": sum_w,
             "depth_hit": hit_depth,
             "depth_mean": mean_z,
             "depth_var": var_z,
+            "max_w": max_w,
             "max_id": max_id
         })
     
