@@ -160,6 +160,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         elapsed_time = iter_start.elapsed_time(iter_end)
 
         with torch.no_grad():
+            skip_step = False
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
@@ -208,6 +209,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             pixels_per_view=compaction.rss_pixels_per_view,
                             alpha_tau=compaction.rss_alpha_tau,
                             lambda_tex=compaction.rss_lambda_tex,
+                            hit_quantile=compaction.rss_hit_quantile,
+                            depth_var_thresh=compaction.rss_depth_var_thresh,
                             voxel_search=compaction.rss_voxel_search,
                             voxel_search_iters=compaction.rss_voxel_search_iters,
                             voxel_size=compaction.rss_voxel_size,
@@ -235,6 +238,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         gaussians.xyz_gradient_accum = torch.zeros((gaussians.get_xyz.shape[0], 1), device="cuda")
                         gaussians.denom = torch.zeros((gaussians.get_xyz.shape[0], 1), device="cuda")
                         gaussians.max_radii2D = torch.zeros((gaussians.get_xyz.shape[0]), device="cuda")
+                        gaussians.optimizer.zero_grad(set_to_none=True)
+                        gaussians.exposure_optimizer.zero_grad(set_to_none=True)
                         if torch.cuda.is_available():
                             peak_mem = torch.cuda.max_memory_allocated()
                             print(f"[RSS] Peak CUDA memory: {peak_mem / (1024 ** 3):.2f} GB")
@@ -252,19 +257,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             )
                         )
                         compaction.finetune_start = time.time()
+                        skip_step = True
                     else:
                         gaussians = subsampling(gaussians, compaction.ratio[index], 42, compaction.method)
             # Optimizer step
             if iteration < opt.iterations:
-                gaussians.exposure_optimizer.step()
-                gaussians.exposure_optimizer.zero_grad(set_to_none = True)
-                if use_sparse_adam:
-                    visible = radii > 0
-                    gaussians.optimizer.step(visible, radii.shape[0])
+                if skip_step:
+                    gaussians.exposure_optimizer.zero_grad(set_to_none = True)
                     gaussians.optimizer.zero_grad(set_to_none = True)
                 else:
-                    gaussians.optimizer.step()
-                    gaussians.optimizer.zero_grad(set_to_none = True)
+                    gaussians.exposure_optimizer.step()
+                    gaussians.exposure_optimizer.zero_grad(set_to_none = True)
+                    if use_sparse_adam:
+                        visible = radii > 0
+                        gaussians.optimizer.step(visible, radii.shape[0])
+                        gaussians.optimizer.zero_grad(set_to_none = True)
+                    else:
+                        gaussians.optimizer.step()
+                        gaussians.optimizer.zero_grad(set_to_none = True)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
@@ -424,6 +434,8 @@ if __name__ == "__main__":
     parser.add_argument("--rss_pixels_per_view", type=int, default=10000)
     parser.add_argument("--rss_alpha_tau", type=float, default=0.05)
     parser.add_argument("--rss_lambda_tex", type=float, default=0.5)
+    parser.add_argument("--rss_hit_quantile", type=float, default=0.7)
+    parser.add_argument("--rss_depth_var_thresh", type=float, default=0.01)
     parser.add_argument("--rss_voxel_search_iters", type=int, default=8)
     parser.add_argument("--rss_voxel_size", type=float, default=0.0)
     parser.add_argument("--rss_no_voxel_search", action="store_true", default=False)
@@ -455,6 +467,8 @@ if __name__ == "__main__":
             rss_pixels_per_view,
             rss_alpha_tau,
             rss_lambda_tex,
+            rss_hit_quantile,
+            rss_depth_var_thresh,
             rss_voxel_search_iters,
             rss_voxel_size,
             rss_no_voxel_search,
@@ -475,6 +489,8 @@ if __name__ == "__main__":
             self.rss_pixels_per_view = rss_pixels_per_view
             self.rss_alpha_tau = rss_alpha_tau
             self.rss_lambda_tex = rss_lambda_tex
+            self.rss_hit_quantile = rss_hit_quantile
+            self.rss_depth_var_thresh = rss_depth_var_thresh
             self.rss_voxel_search_iters = rss_voxel_search_iters
             self.rss_voxel_size = rss_voxel_size
             self.rss_voxel_search = not rss_no_voxel_search
@@ -493,6 +509,8 @@ if __name__ == "__main__":
         args.rss_pixels_per_view,
         args.rss_alpha_tau,
         args.rss_lambda_tex,
+        args.rss_hit_quantile,
+        args.rss_depth_var_thresh,
         args.rss_voxel_search_iters,
         args.rss_voxel_size,
         args.rss_no_voxel_search,

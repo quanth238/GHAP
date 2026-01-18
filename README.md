@@ -47,18 +47,21 @@ Key flags:
 - `--rss_num_views`, `--rss_pixels_per_view` control total samples M = V * P.
 - `--rss_alpha_tau` (default 0.05) filters low-opacity pixels.
 - `--rss_lambda_tex` (default 0.5) weights texture gradients.
+- `--rss_hit_quantile` (default 0.7) sets the termination-depth quantile.
+- `--rss_depth_var_thresh` (default 0.01) rejects multi-layer pixels by depth variance.
 - `--rss_no_depth_gate` disables depth gating.
 - `--rss_no_voxel_search` disables auto voxel-size search; pair with `--rss_voxel_size`.
 
 Notes:
-- RSS uses two renders (black/white background) to estimate alpha without rasterizer changes.
-- Depth returned by the renderer is inverse depth; RSS uses `z = 1 / (invdepth + eps)` for backprojection.
+- RSS uses linear compositing statistics from the rasterizer (`sum_w`, `hit_depth`, `depth_var`) instead of the two-render alpha hack.
+- `hit_depth` is a termination-depth quantile; `depth_var` gates multi-layer pixels.
+- After changing the rasterizer, rebuild the extension (e.g., reinstall the submodule).
 - `train_and_prune.py` accepts both `--iterations` and `--iteration` (alias).
 
 Recommended defaults (K up to 500k):
 - `--rss_num_views 200 --rss_pixels_per_view 10000` (M=2M ~= 4K for K=500k). Increase to 400/10000 for ~8K.
 
 Runtime scaling (rough):
-- Rendering: O(V * T_render) with two renders per view.
+- Rendering: O(V * T_render) with one stats-enabled render per view.
 - Sampling + voxelization: O(M).
 - KD-tree init: O(K log N).

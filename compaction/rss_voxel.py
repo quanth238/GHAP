@@ -1,4 +1,5 @@
 import time
+import math
 from dataclasses import dataclass
 from typing import Dict, Tuple
 
@@ -8,6 +9,7 @@ import torch.nn.functional as F
 
 from gaussian_renderer import render
 from utils.graphics_utils import fov2focal, geom_transform_points
+from utils.general_utils import inverse_sigmoid
 
 try:
     from scipy.spatial import cKDTree
@@ -22,6 +24,8 @@ class RSSVoxelConfig:
     pixels_per_view: int
     alpha_tau: float
     lambda_tex: float
+    hit_quantile: float
+    depth_var_thresh: float
     voxel_search: bool
     voxel_search_iters: int
     voxel_size: float
@@ -65,22 +69,20 @@ def _compute_texture_grad(image: torch.Tensor) -> torch.Tensor:
     return grad
 
 
-def _render_alpha_and_invdepth(view, gaussians, pipe, separate_sh) -> Tuple[torch.Tensor, torch.Tensor]:
+def _render_stats(view, gaussians, pipe, separate_sh, hit_quantile: float) -> Dict[str, torch.Tensor]:
     device = gaussians.get_xyz.device
     bg_black = torch.zeros(3, dtype=torch.float32, device=device)
-    bg_white = torch.ones(3, dtype=torch.float32, device=device)
-
     with torch.no_grad():
-        render0 = render(view, gaussians, pipe, bg_black, use_trained_exp=False, separate_sh=separate_sh)
-        render1 = render(view, gaussians, pipe, bg_white, use_trained_exp=False, separate_sh=separate_sh)
-
-    color0 = render0["render"]
-    color1 = render1["render"]
-    invdepth = render0["depth"][0]
-
-    alpha = 1.0 - (color1 - color0).mean(dim=0)
-    alpha = alpha.clamp(0.0, 1.0)
-    return alpha, invdepth
+        return render(
+            view,
+            gaussians,
+            pipe,
+            bg_black,
+            use_trained_exp=False,
+            separate_sh=separate_sh,
+            return_stats=True,
+            hit_quantile=hit_quantile,
+        )
 
 
 def _backproject(view, u, v, depth) -> torch.Tensor:
@@ -93,26 +95,27 @@ def _backproject(view, u, v, depth) -> torch.Tensor:
     y = (v - cy) / fy * depth
     z = depth
     points_cam = torch.stack([x, y, z], dim=1)
-    view_to_world = view.world_view_transform.inverse()
+    view_to_world = view.world_view_transform.inverse().transpose(0, 1)
     points_world = geom_transform_points(points_cam, view_to_world)
     return points_world
 
 
 def _sample_surface_points(
     view,
-    alpha: torch.Tensor,
-    invdepth: torch.Tensor,
+    opacity: torch.Tensor,
+    depth: torch.Tensor,
+    depth_var: torch.Tensor,
     tex_grad: torch.Tensor,
     cfg: RSSVoxelConfig,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    device = alpha.device
-    h, w = alpha.shape
+    device = opacity.device
+    h, w = opacity.shape
     total_pixels = h * w
-    alpha_flat = alpha.reshape(-1)
-    invdepth_flat = invdepth.reshape(-1)
+    alpha_flat = opacity.reshape(-1)
+    depth_flat = depth.reshape(-1)
+    var_flat = depth_var.reshape(-1) if depth_var is not None else None
     tex_flat = tex_grad.reshape(-1) if tex_grad is not None else None
 
-    eps = 1e-6
     max_attempts = 8
     points_world = []
     weights = []
@@ -126,12 +129,13 @@ def _sample_surface_points(
         a = alpha_flat[idx]
         valid = a > cfg.alpha_tau
 
-        invd = invdepth_flat[idx]
-        valid = torch.logical_and(valid, invd > 0)
-        depth = 1.0 / (invd + eps)
+        d = depth_flat[idx]
+        valid = torch.logical_and(valid, d > 0)
         if cfg.depth_gate:
-            valid = torch.logical_and(valid, depth > view.znear)
-            valid = torch.logical_and(valid, depth < view.zfar)
+            valid = torch.logical_and(valid, d > view.znear)
+            valid = torch.logical_and(valid, d < view.zfar)
+        if var_flat is not None and cfg.depth_var_thresh > 0:
+            valid = torch.logical_and(valid, var_flat[idx] < cfg.depth_var_thresh)
 
         if tex_flat is not None and cfg.lambda_tex > 0:
             wts = a * (1.0 + cfg.lambda_tex * tex_flat[idx])
@@ -141,7 +145,7 @@ def _sample_surface_points(
         if valid.any():
             keep = min(needed, int(valid.sum().item()))
             valid_idx = idx[valid][:keep]
-            depth = depth[valid][:keep]
+            depth = d[valid][:keep]
             wts = wts[valid][:keep]
             u = (valid_idx % w).float()
             v = (valid_idx // w).float()
@@ -225,15 +229,15 @@ def _select_centers(points: np.ndarray, weights: np.ndarray, cfg: RSSVoxelConfig
 
     centers, mass = _voxelize(points, weights, min_xyz, voxel_size)
 
+    if centers.shape[0] < cfg.target_num_gaussians and cfg.voxel_search:
+        for _ in range(4):
+            voxel_size *= 0.5
+            centers, mass = _voxelize(points, weights, min_xyz, voxel_size)
+            if centers.shape[0] >= cfg.target_num_gaussians:
+                break
     if centers.shape[0] > cfg.target_num_gaussians:
         keep = np.argpartition(mass, -cfg.target_num_gaussians)[-cfg.target_num_gaussians:]
         centers = centers[keep]
-    elif centers.shape[0] < cfg.target_num_gaussians:
-        missing = cfg.target_num_gaussians - centers.shape[0]
-        weight_sum = weights.sum()
-        prob = None if weight_sum <= 0 else (weights / weight_sum)
-        extra_idx = np.random.choice(points.shape[0], size=missing, replace=True, p=prob)
-        centers = np.concatenate([centers, points[extra_idx]], axis=0)
 
     return centers.astype(np.float32), voxel_size
 
@@ -265,8 +269,12 @@ def build_student_from_rss_voxel(
     for idx in view_indices:
         view = cams[int(idx)]
         t0 = time.time()
-        alpha, invdepth = _render_alpha_and_invdepth(view, gaussians, pipe, separate_sh)
+        render_pkg = _render_stats(view, gaussians, pipe, separate_sh, cfg.hit_quantile)
         render_time += time.time() - t0
+
+        alpha = render_pkg["opacity"]
+        depth_hit = render_pkg["depth_hit"]
+        depth_var = render_pkg["depth_var"]
 
         if view.alpha_mask is not None:
             alpha = alpha * view.alpha_mask[0].to(alpha.device)
@@ -278,7 +286,7 @@ def build_student_from_rss_voxel(
                 tex_grad = tex_grad * view.alpha_mask[0].to(tex_grad.device)
 
         t0 = time.time()
-        pts, wts = _sample_surface_points(view, alpha, invdepth, tex_grad, cfg)
+        pts, wts = _sample_surface_points(view, alpha, depth_hit, depth_var, tex_grad, cfg)
         sample_time += time.time() - t0
 
         if pts.shape[0] == 0:
@@ -305,6 +313,11 @@ def build_student_from_rss_voxel(
     centers, voxel_size = _select_centers(points, weights, cfg)
     timings["num_centers"] = float(centers.shape[0])
     timings["voxel"] = time.time() - t0
+    if centers.shape[0] < cfg.target_num_gaussians:
+        print(
+            f"[RSS] Warning: voxelization produced K={centers.shape[0]} < target {cfg.target_num_gaussians}. "
+            "Consider decreasing voxel size or increasing rss_voxel_search_iters."
+        )
 
     t0 = time.time()
     teacher_xyz = gaussians.get_xyz.detach().cpu().numpy()
@@ -322,9 +335,12 @@ def build_student_from_rss_voxel(
     with torch.no_grad():
         new_features_dc = gaussians._features_dc[nn_idx_t].detach().clone()
         new_features_rest = gaussians._features_rest[nn_idx_t].detach().clone()
-        new_opacity = gaussians._opacity[nn_idx_t].detach().clone()
-        new_scaling = gaussians._scaling[nn_idx_t].detach().clone()
-        new_rotation = gaussians._rotation[nn_idx_t].detach().clone()
+        init_opacity = inverse_sigmoid(torch.tensor(0.05, device=device, dtype=dtype))
+        new_opacity = torch.full((centers_t.shape[0], 1), init_opacity, device=device, dtype=dtype)
+        base_scale = max(voxel_size * 0.5, 1e-4)
+        new_scaling = torch.full((centers_t.shape[0], 3), math.log(base_scale), device=device, dtype=dtype)
+        new_rotation = torch.zeros((centers_t.shape[0], 4), device=device, dtype=dtype)
+        new_rotation[:, 0] = 1.0
 
     timings["total"] = time.time() - start_total
     timings["voxel_size"] = float(voxel_size)
