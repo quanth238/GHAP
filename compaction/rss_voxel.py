@@ -530,6 +530,21 @@ def build_student_from_rss_voxel(
                     float(np.max(dist)),
                 )
             )
+        sample_n = min(200000, teacher_xyz.shape[0])
+        sample_idx = np.random.choice(teacher_xyz.shape[0], size=sample_n, replace=False)
+        teacher_sample = teacher_xyz[sample_idx]
+        teacher_tree = cKDTree(teacher_xyz)
+        tdist, _ = teacher_tree.query(teacher_sample, k=2, workers=-1)
+        if tdist.size > 0:
+            nn_dist = tdist[:, 1]
+            print(
+                "[RSS][Debug] NN distance teacher->teacher: med={:.6f} p95={:.6f} max={:.6f}".format(
+                    float(np.median(nn_dist)),
+                    float(np.percentile(nn_dist, 95)),
+                    float(np.max(nn_dist)),
+                )
+            )
+        print(f"[RSS][Debug] scene.cameras_extent={scene.cameras_extent:.6f}")
 
     device = gaussians.get_xyz.device
     dtype = gaussians.get_xyz.dtype
