@@ -99,7 +99,9 @@ def _backproject(view, u, v, depth) -> torch.Tensor:
     y = (v - cy) / fy * depth
     z = depth
     points_cam = torch.stack([x, y, z], dim=1)
-    view_to_world = view.world_view_transform.inverse().transpose(0, 1)
+    # world_view_transform is stored as row-vector matrix (w2c^T). For row-vector
+    # points, camera->world is the inverse without an extra transpose.
+    view_to_world = view.world_view_transform.inverse()
     points_world = geom_transform_points(points_cam, view_to_world)
     return points_world
 
@@ -420,12 +422,18 @@ def build_student_from_rss_voxel(
     with torch.no_grad():
         new_features_dc = gaussians._features_dc[nn_idx_t].detach().clone()
         new_features_rest = gaussians._features_rest[nn_idx_t].detach().clone()
-        init_opacity = inverse_sigmoid(torch.tensor(0.05, device=device, dtype=dtype))
-        new_opacity = torch.full((centers_t.shape[0], 1), init_opacity, device=device, dtype=dtype)
-        base_scale = max(voxel_size * 0.5, 1e-4)
-        new_scaling = torch.full((centers_t.shape[0], 3), math.log(base_scale), device=device, dtype=dtype)
-        new_rotation = torch.zeros((centers_t.shape[0], 4), device=device, dtype=dtype)
-        new_rotation[:, 0] = 1.0
+        teacher_opacity = gaussians.get_opacity[nn_idx_t].detach()
+        teacher_scaling = gaussians.get_scaling[nn_idx_t].detach()
+        teacher_rotation = gaussians.get_rotation[nn_idx_t].detach()
+
+        min_scale = max(voxel_size * 0.1, 1e-4)
+        max_scale = max(voxel_size * 4.0, min_scale * 2.0)
+        clamped_scaling = torch.clamp(teacher_scaling, min=min_scale, max=max_scale)
+        new_scaling = torch.log(clamped_scaling)
+
+        clamped_opacity = torch.clamp(teacher_opacity, min=0.05, max=0.9)
+        new_opacity = inverse_sigmoid(clamped_opacity)
+        new_rotation = teacher_rotation
 
     timings["total"] = time.time() - start_total
     timings["voxel_size"] = float(voxel_size)
