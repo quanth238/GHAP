@@ -37,6 +37,9 @@ class RSSVoxelConfig:
     min_centers_abs: int = 20000
     debug: bool = False
     debug_samples: int = 10000
+    snap_to_teacher: bool = False
+    snap_factor: float = 5.0
+    snap_min: float = 0.0
 
 
 def _select_view_indices(num_views: int, total_views: int) -> np.ndarray:
@@ -517,10 +520,29 @@ def build_student_from_rss_voxel(
     if cKDTree is None:
         raise RuntimeError("SciPy not available for KD-tree search.")
     tree = cKDTree(teacher_xyz)
-    _, nn_idx = tree.query(centers, k=1, workers=-1)
+    dist, nn_idx = tree.query(centers, k=1, workers=-1)
     timings["kdtree"] = time.time() - t0
+
+    if cfg.snap_to_teacher:
+        sample_n = min(200000, teacher_xyz.shape[0])
+        sample_idx = np.random.choice(teacher_xyz.shape[0], size=sample_n, replace=False)
+        tdist, _ = tree.query(teacher_xyz[sample_idx], k=2, workers=-1)
+        nn_dist = tdist[:, 1] if tdist.size > 0 else np.array([], dtype=np.float32)
+        med_nn = float(np.median(nn_dist)) if nn_dist.size > 0 else 0.0
+        snap_thresh = max(cfg.snap_min, cfg.snap_factor * med_nn)
+        snap_mask = dist > snap_thresh
+        if snap_mask.any():
+            centers[snap_mask] = teacher_xyz[nn_idx[snap_mask]]
+        print(
+            "[RSS] Snap centers: thresh={:.6f} med_nn={:.6f} snapped={}/{}".format(
+                snap_thresh,
+                med_nn,
+                int(snap_mask.sum()),
+                centers.shape[0],
+            )
+        )
+
     if cfg.debug:
-        dist, _ = tree.query(centers, k=1, workers=-1)
         dist = dist.astype(np.float32)
         if dist.size > 0:
             print(
@@ -532,9 +554,7 @@ def build_student_from_rss_voxel(
             )
         sample_n = min(200000, teacher_xyz.shape[0])
         sample_idx = np.random.choice(teacher_xyz.shape[0], size=sample_n, replace=False)
-        teacher_sample = teacher_xyz[sample_idx]
-        teacher_tree = cKDTree(teacher_xyz)
-        tdist, _ = teacher_tree.query(teacher_sample, k=2, workers=-1)
+        tdist, _ = tree.query(teacher_xyz[sample_idx], k=2, workers=-1)
         if tdist.size > 0:
             nn_dist = tdist[:, 1]
             print(

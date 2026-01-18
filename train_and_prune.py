@@ -244,6 +244,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             seed=compaction.rss_seed,
                             debug=compaction.rss_debug,
                             debug_samples=compaction.rss_debug_samples,
+                            snap_to_teacher=compaction.rss_snap_to_teacher,
+                            snap_factor=compaction.rss_snap_factor,
+                            snap_min=compaction.rss_snap_min,
                         )
 
                         new_params, timings = build_student_from_rss_voxel(
@@ -472,6 +475,9 @@ if __name__ == "__main__":
     parser.add_argument("--rss_depth_var_thresh", type=float, default=0.01)
     parser.add_argument("--rss_debug", action="store_true", default=False)
     parser.add_argument("--rss_debug_samples", type=int, default=10000)
+    parser.add_argument("--rss_snap_to_teacher", action="store_true", default=False)
+    parser.add_argument("--rss_snap_factor", type=float, default=5.0)
+    parser.add_argument("--rss_snap_min", type=float, default=0.0)
     parser.add_argument("--rss_voxel_search_iters", type=int, default=8)
     parser.add_argument("--rss_voxel_size", type=float, default=0.0)
     parser.add_argument("--rss_no_voxel_search", action="store_true", default=False)
@@ -507,6 +513,9 @@ if __name__ == "__main__":
             rss_depth_var_thresh,
             rss_debug,
             rss_debug_samples,
+            rss_snap_to_teacher,
+            rss_snap_factor,
+            rss_snap_min,
             rss_voxel_search_iters,
             rss_voxel_size,
             rss_no_voxel_search,
@@ -531,6 +540,9 @@ if __name__ == "__main__":
             self.rss_depth_var_thresh = rss_depth_var_thresh
             self.rss_debug = rss_debug
             self.rss_debug_samples = rss_debug_samples
+            self.rss_snap_to_teacher = rss_snap_to_teacher
+            self.rss_snap_factor = rss_snap_factor
+            self.rss_snap_min = rss_snap_min
             self.rss_voxel_search_iters = rss_voxel_search_iters
             self.rss_voxel_size = rss_voxel_size
             self.rss_voxel_search = not rss_no_voxel_search
@@ -553,6 +565,9 @@ if __name__ == "__main__":
         args.rss_depth_var_thresh,
         args.rss_debug,
         args.rss_debug_samples,
+        args.rss_snap_to_teacher,
+        args.rss_snap_factor,
+        args.rss_snap_min,
         args.rss_voxel_search_iters,
         args.rss_voxel_size,
         args.rss_no_voxel_search,
