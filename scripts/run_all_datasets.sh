@@ -13,7 +13,6 @@ COMPACTION_METHOD="${COMPACTION_METHOD:-rss_voxel}" # options: ghap, rss_voxel
 SAMPLING_RATIO="${SAMPLING_RATIO:-0.1}"
 TARGET_NUM_GAUSSIANS="${TARGET_NUM_GAUSSIANS:-}" # set to override ratio (e.g., 300000)
 TWO_PHASE="${TWO_PHASE:-yes}" # "yes" for 2-phase recovery after compaction
-PHASE1_ITER="${PHASE1_ITER:-20000}"
 PHASE2_ITER="${PHASE2_ITER:-30000}"
 
 # Dataset roots (edit these)
@@ -38,7 +37,7 @@ if [[ "$COMPACTION_METHOD" == "rss_voxel" ]]; then
     --rss_teacher_selector octree
     --rss_alpha_tau 0.02
     --rss_hit_quantile 0.3
-    --rss_lambda_tex 0.25
+    --rss_lambda_tex 0.5
     --rss_debug
   )
 fi
@@ -50,7 +49,7 @@ fi
 PHASE1_LR_ARGS=(
   --position_lr_init 1.6e-4
   --position_lr_final 2e-5
-  --position_lr_max_steps 60000
+  --position_lr_max_steps "$PHASE2_ITER"
   --scaling_lr 0.008
   --opacity_lr 0.05
   --feature_lr 0.003
@@ -92,13 +91,16 @@ run_scene() {
   local base_out="${scene_out}/baseline"
   local compact_out="${scene_out}/${EXP_TITLE}_${tag}"
   local ckpt="${base_out}/chkpnt15000.pth"
-  local phase1_iter="${PHASE1_ITER}"
+  local sampling_iter=15001
+  local phase1_iter
   local final_iter="${PHASE2_ITER}"
   local -a phase1_test_iters
   local -a phase1_save_iters
   local -a phase1_ckpt_iters
 
-  if [[ "$TWO_PHASE" != "yes" ]]; then
+  if [[ "$TWO_PHASE" == "yes" ]]; then
+    phase1_iter=$(( sampling_iter + (PHASE2_ITER - sampling_iter) / 3 ))
+  else
     phase1_iter="${PHASE2_ITER}"
     final_iter="${PHASE2_ITER}"
   fi
@@ -147,7 +149,7 @@ run_scene() {
     --test_iterations "${phase1_test_iters[@]}" \
     --save_iterations "${phase1_save_iters[@]}" \
     --checkpoint_iterations "${phase1_ckpt_iters[@]}" \
-    --sampling_iter 15001 \
+    --sampling_iter "$sampling_iter" \
     "${COMMON_COMPACT_ARGS[@]}" \
     "${PHASE1_LR_ARGS[@]}"
 
