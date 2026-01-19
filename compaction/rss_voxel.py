@@ -45,6 +45,7 @@ class RSSVoxelConfig:
     snap_min: float = 0.0
     snap_unique: bool = False
     snap_fill_teacher: bool = True
+    mass_topk: int = 4
 
 
 def _select_view_indices(num_views: int, total_views: int) -> np.ndarray:
@@ -83,7 +84,7 @@ def _compute_texture_grad(image: torch.Tensor) -> torch.Tensor:
     return grad
 
 
-def _render_stats(view, gaussians, pipe, separate_sh, hit_quantile: float) -> Dict[str, torch.Tensor]:
+def _render_stats(view, gaussians, pipe, separate_sh, hit_quantile: float, topk_contrib: int) -> Dict[str, torch.Tensor]:
     device = gaussians.get_xyz.device
     bg_black = torch.zeros(3, dtype=torch.float32, device=device)
     with torch.no_grad():
@@ -96,6 +97,7 @@ def _render_stats(view, gaussians, pipe, separate_sh, hit_quantile: float) -> Di
             separate_sh=separate_sh,
             return_stats=True,
             hit_quantile=hit_quantile,
+            topk_contrib=topk_contrib,
         )
 
 
@@ -640,33 +642,57 @@ def build_student_from_rss_voxel(
         for idx in view_indices:
             view = cams[int(idx)]
             t0 = time.time()
-            render_pkg = _render_stats(view, gaussians, pipe, separate_sh, cfg.hit_quantile)
+            render_pkg = _render_stats(view, gaussians, pipe, separate_sh, cfg.hit_quantile, cfg.mass_topk)
             render_time += time.time() - t0
 
             sum_w = render_pkg["opacity"]
             max_id = render_pkg["max_id"]
             max_w = render_pkg["max_w"]
+            topk_id = render_pkg.get("topk_id")
+            topk_w = render_pkg.get("topk_w")
+            use_topk = topk_id is not None and topk_w is not None and topk_id.dim() == 3 and topk_id.shape[0] > 1
 
             if view.alpha_mask is not None:
                 mask = view.alpha_mask[0].to(sum_w.device)
                 sum_w = sum_w * mask
                 max_w = max_w * mask
+                if use_topk:
+                    topk_w = topk_w * mask
 
-            valid = torch.logical_and(max_id >= 0, sum_w > cfg.alpha_tau)
-            valid = torch.logical_and(valid, max_w > 0)
-            num_valid += int(valid.sum().item())
+            valid_pix = sum_w > cfg.alpha_tau
+            num_valid += int(valid_pix.sum().item())
 
-            if valid.any():
+            if valid_pix.any():
+                tex_weight = None
                 if cfg.lambda_tex > 0:
                     tex_grad = _compute_texture_grad(view.original_image.to(sum_w.device))
                     if view.alpha_mask is not None:
                         tex_grad = tex_grad * mask
-                    weights = max_w[valid] * (1.0 + cfg.lambda_tex * tex_grad[valid])
+                    tex_weight = 1.0 + cfg.lambda_tex * tex_grad
+
+                if use_topk:
+                    if tex_weight is not None:
+                        weights = topk_w[:, valid_pix] * tex_weight[valid_pix].unsqueeze(0)
+                    else:
+                        weights = topk_w[:, valid_pix]
+                    ids = topk_id[:, valid_pix].reshape(-1).to(torch.int64)
+                    weights = weights.reshape(-1)
+                    valid_contrib = torch.logical_and(ids >= 0, weights > 0)
+                    if valid_contrib.any():
+                        ids = ids[valid_contrib]
+                        weights = weights[valid_contrib]
+                        counts = torch.bincount(ids, weights=weights, minlength=teacher_xyz.shape[0])
+                        mass += counts.detach().cpu().numpy().astype(np.float32)
                 else:
-                    weights = max_w[valid]
-                ids = max_id[valid].to(torch.int64)
-                counts = torch.bincount(ids, weights=weights, minlength=teacher_xyz.shape[0])
-                mass += counts.detach().cpu().numpy().astype(np.float32)
+                    valid = torch.logical_and(max_id >= 0, valid_pix)
+                    valid = torch.logical_and(valid, max_w > 0)
+                    if valid.any():
+                        weights = max_w[valid]
+                        if tex_weight is not None:
+                            weights = weights * tex_weight[valid]
+                        ids = max_id[valid].to(torch.int64)
+                        counts = torch.bincount(ids, weights=weights, minlength=teacher_xyz.shape[0])
+                        mass += counts.detach().cpu().numpy().astype(np.float32)
 
         timings["render_sampling"] = render_time
         timings["num_samples_raw"] = float(num_valid)
@@ -719,7 +745,7 @@ def build_student_from_rss_voxel(
         for idx in view_indices:
             view = cams[int(idx)]
             t0 = time.time()
-            render_pkg = _render_stats(view, gaussians, pipe, separate_sh, cfg.hit_quantile)
+            render_pkg = _render_stats(view, gaussians, pipe, separate_sh, cfg.hit_quantile, 1)
             render_time += time.time() - t0
 
             alpha = render_pkg["opacity"]

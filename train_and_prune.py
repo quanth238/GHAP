@@ -254,6 +254,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             snap_min=compaction.rss_snap_min,
                             snap_unique=compaction.rss_snap_unique,
                             snap_fill_teacher=compaction.rss_snap_fill_teacher,
+                            mass_topk=compaction.rss_mass_topk,
                         )
 
                         new_params, timings = build_student_from_rss_voxel(
@@ -525,6 +526,7 @@ if __name__ == "__main__":
     parser.add_argument("--rss_lambda_tex", type=float, default=0.5)
     parser.add_argument("--rss_hit_quantile", type=float, default=0.7)
     parser.add_argument("--rss_depth_var_thresh", type=float, default=0.01)
+    parser.add_argument("--rss_mass_topk", type=int, default=4)
     parser.add_argument("--rss_center_mode", type=str, default="mean", choices=["mean", "representative", "teacher"])
     parser.add_argument("--rss_teacher_selector", type=str, default="voxel", choices=["voxel", "octree"])
     parser.add_argument("--rss_debug", action="store_true", default=False)
@@ -581,6 +583,7 @@ if __name__ == "__main__":
             rss_no_voxel_search,
             rss_no_depth_gate,
             rss_seed,
+            rss_mass_topk,
         ):
             self.flag = compact
             self.iter = sampling_iter
@@ -612,6 +615,7 @@ if __name__ == "__main__":
             self.rss_voxel_search = not rss_no_voxel_search
             self.rss_depth_gate = not rss_no_depth_gate
             self.rss_seed = rss_seed
+            self.rss_mass_topk = rss_mass_topk
             self.finetune_start = None
     # Start GUI server, configure and run training
     compaction = Compact(
@@ -641,6 +645,7 @@ if __name__ == "__main__":
         args.rss_no_voxel_search,
         args.rss_no_depth_gate,
         args.rss_seed,
+        args.rss_mass_topk,
     )
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)

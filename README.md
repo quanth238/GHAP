@@ -48,6 +48,7 @@ Key flags:
 - `--rss_lambda_tex` (default 0.5) weights texture gradients.
 - `--rss_hit_quantile` (default 0.7) sets the termination-depth quantile.
 - `--rss_depth_var_thresh` (default 0.01) rejects multi-layer pixels by depth variance.
+- `--rss_mass_topk` (default 4) accumulates top-L contributors per pixel for mass (L=1 matches dominant-only).
 - `--rss_no_depth_gate` disables depth gating.
 - `--rss_no_voxel_search` disables auto voxel-size search; pair with `--rss_voxel_size`.
 

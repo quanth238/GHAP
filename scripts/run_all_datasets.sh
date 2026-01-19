@@ -14,11 +14,12 @@ SAMPLING_RATIO="${SAMPLING_RATIO:-0.1}"
 TARGET_NUM_GAUSSIANS="${TARGET_NUM_GAUSSIANS:-}" # set to override ratio (e.g., 300000)
 TWO_PHASE="${TWO_PHASE:-yes}" # "yes" for 2-phase recovery after compaction
 PHASE2_ITER="${PHASE2_ITER:-30000}"
+RSS_MASS_TOPK="${RSS_MASS_TOPK:-4}"
 
 # Dataset roots (edit these)
-TANKS_ROOT="${TANKS_ROOT:-/path/to/tanks_and_temples}"
-DEEP_ROOT="${DEEP_ROOT:-/path/to/deep_blending}"
-MIP_ROOT="${MIP_ROOT:-/path/to/mipnerf360}"
+TANKS_ROOT="${TANKS_ROOT:-/home/tri-dev/dev/namn_workspace/dataset/tanks_and_temples}"
+DEEP_ROOT="${DEEP_ROOT:-/home/tri-dev/dev/namn_workspace/dataset/deep_blending}"
+MIP_ROOT="${MIP_ROOT:-/home/tri-dev/dev/namn_workspace/dataset/mipnerf360}"
 
 # Dataset scene lists
 TANKS_SCENES=(train truck)
@@ -38,6 +39,7 @@ if [[ "$COMPACTION_METHOD" == "rss_voxel" ]]; then
     --rss_alpha_tau 0.02
     --rss_hit_quantile 0.3
     --rss_lambda_tex 0.5
+    --rss_mass_topk "$RSS_MASS_TOPK"
     --rss_debug
   )
 fi
