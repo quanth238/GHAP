@@ -90,7 +90,7 @@ run_scene() {
 
   local src="${dataset_root}/${scene}"
   local scene_out="${OUT_DIR}/${dataset_name}/${scene}"
-  local base_out="${scene_out}/baseline"
+  local base_out="${scene_out}/baseline_run${run_idx}"
   local compact_out="${scene_out}/${EXP_TITLE}_${run_tag}"
   local ckpt="${base_out}/chkpnt15000.pth"
   local sampling_iter=15001
@@ -116,6 +116,7 @@ run_scene() {
       -s "$src" \
       -m "$base_out" \
       -i "$images_dir" \
+      --rss_seed "$run_seed" \
       --eval \
       --disable_viewer \
       --iterations 15000 \
