@@ -99,7 +99,7 @@ run_scene() {
   local -a phase1_ckpt_iters
 
   if [[ "$TWO_PHASE" == "yes" ]]; then
-    phase1_iter=$(( sampling_iter + (PHASE2_ITER - sampling_iter) / 3 ))
+    phase1_iter=$(( sampling_iter + (PHASE2_ITER - sampling_iter) / 2 ))
   else
     phase1_iter="${PHASE2_ITER}"
     final_iter="${PHASE2_ITER}"

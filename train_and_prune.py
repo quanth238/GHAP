@@ -267,6 +267,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                 compaction.logged_counts = True
                                 compaction.did_compact = True
                         else:
+                            compaction.voxel_size = timings.get("voxel_size", None)
                             if compaction.rss_debug:
                                 _log_optimizer_state(gaussians.optimizer, "pre_compaction")
                             xyz_tensors = gaussians.replace_tensor_to_optimizer(new_params["xyz"], "xyz")
@@ -303,6 +304,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                     timings.get("num_centers", 0.0),
                                 )
                             )
+                            if "scale_low_ratio" in timings and not getattr(compaction, "logged_clamp_ratios", False):
+                                print(
+                                    "[RSS] Clamp ratios: scale_low={:.2f}% scale_high={:.2f}% "
+                                    "opacity_low={:.2f}% opacity_high={:.2f}%".format(
+                                        100.0 * timings.get("scale_low_ratio", 0.0),
+                                        100.0 * timings.get("scale_high_ratio", 0.0),
+                                        100.0 * timings.get("opacity_low_ratio", 0.0),
+                                        100.0 * timings.get("opacity_high_ratio", 0.0),
+                                    )
+                                )
+                                compaction.logged_clamp_ratios = True
                             if not getattr(compaction, "logged_counts", False):
                                 post_compact_count = int(gaussians.get_xyz.shape[0])
                                 print(f"[RSS] Gaussians post-compaction: {post_compact_count}")
@@ -338,6 +350,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if compaction.finetune_start is not None:
             finetune_time = time.time() - compaction.finetune_start
             print(f"[RSS] Finetune time: {finetune_time:.2f}s")
+            if compaction.voxel_size and not getattr(compaction, "logged_post_finetune_clamp", False):
+                min_scale = max(float(compaction.voxel_size) * 0.1, 1e-4)
+                max_scale = max(float(compaction.voxel_size) * 4.0, min_scale * 2.0)
+                with torch.no_grad():
+                    scales = scene.gaussians.get_scaling.detach()
+                    opacities = scene.gaussians.get_opacity.detach()
+                    scale_low = float((scales < min_scale).float().mean().item())
+                    scale_high = float((scales > max_scale).float().mean().item())
+                    op_low = float((opacities < 0.05).float().mean().item())
+                    op_high = float((opacities > 0.9).float().mean().item())
+                print(
+                    "[RSS] Clamp ratios (post-finetune): scale_low={:.2f}% scale_high={:.2f}% "
+                    "opacity_low={:.2f}% opacity_high={:.2f}%".format(
+                        100.0 * scale_low,
+                        100.0 * scale_high,
+                        100.0 * op_low,
+                        100.0 * op_high,
+                    )
+                )
+                compaction.logged_post_finetune_clamp = True
         if getattr(compaction, "did_compact", False):
             final_count = int(scene.gaussians.get_xyz.shape[0])
             print(f"[RSS] Final gaussians: {final_count}")

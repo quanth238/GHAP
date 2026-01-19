@@ -951,11 +951,15 @@ def build_student_from_rss_voxel(
         clamped_opacity = torch.clamp(teacher_opacity, min=op_min, max=op_max)
         new_opacity = inverse_sigmoid(clamped_opacity)
         new_rotation = teacher_rotation
+        scale_low = float((teacher_scaling < min_scale).float().mean().item())
+        scale_high = float((teacher_scaling > max_scale).float().mean().item())
+        op_low = float((teacher_opacity < op_min).float().mean().item())
+        op_high = float((teacher_opacity > op_max).float().mean().item())
+        timings["scale_low_ratio"] = scale_low
+        timings["scale_high_ratio"] = scale_high
+        timings["opacity_low_ratio"] = op_low
+        timings["opacity_high_ratio"] = op_high
         if cfg.debug:
-            scale_low = float((teacher_scaling < min_scale).float().mean().item())
-            scale_high = float((teacher_scaling > max_scale).float().mean().item())
-            op_low = float((teacher_opacity < op_min).float().mean().item())
-            op_high = float((teacher_opacity > op_max).float().mean().item())
             print(
                 "[RSS][Debug] Clamp ratios: scale_low={:.2f}% scale_high={:.2f}% "
                 "opacity_low={:.2f}% opacity_high={:.2f}%".format(
