@@ -638,6 +638,12 @@ def build_student_from_rss_voxel(
         mass = np.zeros((teacher_xyz.shape[0],), dtype=np.float32)
         render_time = 0.0
         num_valid = 0
+        ratio_sum = 0.0
+        ratio_count = 0
+        topk_total = 0
+        topk_kept = 0
+        topk_drop_alpha = 0
+        topk_drop_invalid = 0
 
         for idx in view_indices:
             view = cams[int(idx)]
@@ -671,6 +677,21 @@ def build_student_from_rss_voxel(
                     tex_weight = 1.0 + cfg.lambda_tex * tex_grad
 
                 if use_topk:
+                    if cfg.debug:
+                        sum_topk = topk_w.sum(dim=0)
+                        ratio = sum_topk[valid_pix] / (sum_w[valid_pix] + 1e-8)
+                        ratio_sum += float(ratio.mean().item())
+                        ratio_count += 1
+                        total = int(topk_id.numel())
+                        drop_alpha = int((~valid_pix).sum().item()) * topk_id.shape[0]
+                        valid_ids = topk_id[:, valid_pix]
+                        valid_w = topk_w[:, valid_pix]
+                        valid_contrib = torch.logical_and(valid_ids >= 0, valid_w > 0)
+                        kept = int(valid_contrib.sum().item())
+                        topk_total += total
+                        topk_kept += kept
+                        topk_drop_alpha += drop_alpha
+                        topk_drop_invalid += int((~valid_contrib).sum().item())
                     if tex_weight is not None:
                         weights = topk_w[:, valid_pix] * tex_weight[valid_pix].unsqueeze(0)
                     else:
@@ -697,6 +718,20 @@ def build_student_from_rss_voxel(
         timings["render_sampling"] = render_time
         timings["num_samples_raw"] = float(num_valid)
         timings["num_samples"] = float(num_valid)
+        if cfg.debug and use_topk and topk_total > 0:
+            mean_ratio = ratio_sum / max(ratio_count, 1)
+            kept_rate = 100.0 * topk_kept / topk_total
+            drop_alpha_rate = 100.0 * topk_drop_alpha / topk_total
+            drop_invalid_rate = 100.0 * topk_drop_invalid / topk_total
+            print(
+                "[RSS][Debug] TopK stats: mean(sum_topk/sum_w)={:.3f} kept={:.2f}% "
+                "drop_alpha={:.2f}% drop_invalid={:.2f}%".format(
+                    mean_ratio,
+                    kept_rate,
+                    drop_alpha_rate,
+                    drop_invalid_rate,
+                )
+            )
         if mass.sum() <= 0:
             raise RuntimeError("Teacher-space resampling collected 0 mass across views.")
 
