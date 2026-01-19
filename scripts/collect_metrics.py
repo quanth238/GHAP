@@ -77,6 +77,23 @@ def _fmt(val):
     return "" if val is None else str(val)
 
 
+def _maybe_float(val):
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _mean_std(values):
+    if not values:
+        return None, None
+    mean = sum(values) / len(values)
+    var = sum((v - mean) ** 2 for v in values) / len(values)
+    return mean, var ** 0.5
+
+
 def append_rows(args):
     run_baseline = _is_true(args.run_baseline)
     with open(args.table_out, "a") as f:
@@ -156,6 +173,66 @@ def append_averages(args):
             )
 
 
+def aggregate_runs(args):
+    acc = {}
+    for path in args.tables:
+        if not os.path.isfile(path):
+            raise FileNotFoundError(path)
+        with open(path) as f:
+            reader = csv.DictReader(f)
+            for r in reader:
+                scene = r.get("scene")
+                variant = r.get("variant")
+                if args.only_average and scene != "AVERAGE":
+                    continue
+                if not scene or not variant:
+                    continue
+                key = (scene, variant)
+                if key not in acc:
+                    acc[key] = {
+                        "SSIM": [],
+                        "PSNR": [],
+                        "LPIPS": [],
+                        "G_before": [],
+                        "G_after": [],
+                    }
+                ssim = _maybe_float(r.get("SSIM"))
+                psnr = _maybe_float(r.get("PSNR"))
+                lpips = _maybe_float(r.get("LPIPS"))
+                g_before = _maybe_float(r.get("G_before"))
+                g_after = _maybe_float(r.get("G_after"))
+                if ssim is not None:
+                    acc[key]["SSIM"].append(ssim)
+                if psnr is not None:
+                    acc[key]["PSNR"].append(psnr)
+                if lpips is not None:
+                    acc[key]["LPIPS"].append(lpips)
+                if g_before is not None:
+                    acc[key]["G_before"].append(g_before)
+                if g_after is not None:
+                    acc[key]["G_after"].append(g_after)
+
+    with open(args.out, "w") as f:
+        f.write(
+            "scene,variant,SSIM_mean,SSIM_std,PSNR_mean,PSNR_std,"
+            "LPIPS_mean,LPIPS_std,G_before_mean,G_before_std,G_after_mean,G_after_std\n"
+        )
+        for (scene, variant) in sorted(acc.keys()):
+            ssim_m, ssim_s = _mean_std(acc[(scene, variant)]["SSIM"])
+            psnr_m, psnr_s = _mean_std(acc[(scene, variant)]["PSNR"])
+            lpips_m, lpips_s = _mean_std(acc[(scene, variant)]["LPIPS"])
+            g_before_m, g_before_s = _mean_std(acc[(scene, variant)]["G_before"])
+            g_after_m, g_after_s = _mean_std(acc[(scene, variant)]["G_after"])
+            f.write(
+                f"{scene},{variant},"
+                f"{_fmt(ssim_m)},{_fmt(ssim_s)},"
+                f"{_fmt(psnr_m)},{_fmt(psnr_s)},"
+                f"{_fmt(lpips_m)},{_fmt(lpips_s)},"
+                f"{_fmt(g_before_m)},{_fmt(g_before_s)},"
+                f"{_fmt(g_after_m)},{_fmt(g_after_s)}\n"
+            )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Collect metrics and Gaussian counts into CSV tables."
@@ -175,11 +252,18 @@ def main():
     avg = subparsers.add_parser("average", help="Append average rows to CSV.")
     avg.add_argument("table_out")
 
+    aggregate = subparsers.add_parser("aggregate", help="Aggregate mean/std across runs.")
+    aggregate.add_argument("out")
+    aggregate.add_argument("tables", nargs="+")
+    aggregate.add_argument("--only_average", action="store_true", default=False)
+
     args = parser.parse_args()
     if args.command == "append":
         append_rows(args)
     elif args.command == "average":
         append_averages(args)
+    elif args.command == "aggregate":
+        aggregate_runs(args)
 
 
 if __name__ == "__main__":

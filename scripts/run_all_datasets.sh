@@ -8,6 +8,8 @@ CUDA_DEVICE="${CUDA_DEVICE:-3}"
 RUN_BASELINE="${RUN_BASELINE:-no}" # "yes" to train baseline checkpoints
 OUT_DIR="${OUT_DIR:-./experiments}"
 EXP_TITLE="${EXP_TITLE:-compact_run}"
+RUNS="${RUNS:-5}"
+RSS_SEED_BASE="${RSS_SEED_BASE:-42}"
 
 COMPACTION_METHOD="${COMPACTION_METHOD:-rss_voxel}" # options: ghap, rss_voxel
 SAMPLING_RATIO="${SAMPLING_RATIO:-0.1}"
@@ -16,18 +18,15 @@ TWO_PHASE="${TWO_PHASE:-yes}" # "yes" for 2-phase recovery after compaction
 PHASE2_ITER="${PHASE2_ITER:-30000}"
 
 # Dataset roots (edit these)
-TANKS_ROOT="${TANKS_ROOT:-/path/to/tanks_and_temples}"
-DEEP_ROOT="${DEEP_ROOT:-/path/to/deep_blending}"
-MIP_ROOT="${MIP_ROOT:-/path/to/mipnerf360}"
+TANKS_ROOT="${TANKS_ROOT:-/home/tri-dev/dev/namn_workspace/dataset/tanks_and_temples}"
+DEEP_ROOT="${DEEP_ROOT:-/home/tri-dev/dev/namn_workspace/dataset/deep_blending}"
+MIP_ROOT="${MIP_ROOT:-/home/tri-dev/dev/namn_workspace/dataset/mipnerf360}"
 
 # Dataset scene lists
 TANKS_SCENES=(train truck)
-# DEEP_SCENES=(drjohnson playroom)
-# MIP_OUTDOOR_SCENES=(bicycle flowers garden stump treehill)
-# MIP_INDOOR_SCENES=(room counter kitchen bonsai)
-DEEP_SCENES=()
-MIP_OUTDOOR_SCENES=()
-MIP_INDOOR_SCENES=()
+DEEP_SCENES=(drjohnson playroom)
+MIP_OUTDOOR_SCENES=(bicycle flowers garden stump treehill)
+MIP_INDOOR_SCENES=(room counter kitchen bonsai)
 
 # Optional extra flags for compaction runs
 COMMON_COMPACT_ARGS=()
@@ -83,13 +82,16 @@ run_scene() {
   local scene="$3"
   local images_dir="$4"
   local table_out="$5"
+  local run_idx="$6"
+  local run_seed="$7"
   local tag
   tag="$(make_tag)"
+  local run_tag="${tag}_run${run_idx}"
 
   local src="${dataset_root}/${scene}"
   local scene_out="${OUT_DIR}/${dataset_name}/${scene}"
   local base_out="${scene_out}/baseline"
-  local compact_out="${scene_out}/${EXP_TITLE}_${tag}"
+  local compact_out="${scene_out}/${EXP_TITLE}_${run_tag}"
   local ckpt="${base_out}/chkpnt15000.pth"
   local sampling_iter=15001
   local phase1_iter
@@ -109,7 +111,7 @@ run_scene() {
   phase1_ckpt_iters=("$phase1_iter")
 
   # 1) Baseline training (no compact), stop at 15000, save checkpoint
-  if [[ "$RUN_BASELINE" == "yes" ]]; then
+  if [[ "$RUN_BASELINE" == "yes" && ! -f "$ckpt" ]]; then
     CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" python train_and_prune.py \
       -s "$src" \
       -m "$base_out" \
@@ -124,8 +126,11 @@ run_scene() {
     # 2) Baseline render + metrics
     CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" python render.py --iteration 15000 -s "$src" -m "$base_out" --eval --skip_train
     CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" python metrics.py -m "$base_out"
+  elif [[ "$RUN_BASELINE" == "yes" && ! -f "${base_out}/results.json" ]]; then
+    CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" python render.py --iteration 15000 -s "$src" -m "$base_out" --eval --skip_train
+    CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" python metrics.py -m "$base_out"
   else
-    echo "Skipping baseline for ${dataset_name}/${scene} (RUN_BASELINE=no)"
+    echo "Skipping baseline for ${dataset_name}/${scene} (already exists or RUN_BASELINE=no)"
   fi
 
   # 3) Compact from baseline checkpoint
@@ -133,6 +138,11 @@ run_scene() {
     echo "Missing checkpoint: $ckpt"
     echo "Skip compact for ${dataset_name}/${scene}. Set RUN_BASELINE=yes or provide the checkpoint."
     return 0
+  fi
+
+  local -a run_compact_args=("${COMMON_COMPACT_ARGS[@]}")
+  if [[ "$COMPACTION_METHOD" == "rss_voxel" ]]; then
+    run_compact_args+=(--rss_seed "$run_seed")
   fi
 
   CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" python train_and_prune.py \
@@ -150,7 +160,7 @@ run_scene() {
     --save_iterations "${phase1_save_iters[@]}" \
     --checkpoint_iterations "${phase1_ckpt_iters[@]}" \
     --sampling_iter "$sampling_iter" \
-    "${COMMON_COMPACT_ARGS[@]}" \
+    "${run_compact_args[@]}" \
     "${PHASE1_LR_ARGS[@]}"
 
   if [[ "$TWO_PHASE" == "yes" ]]; then
@@ -195,17 +205,26 @@ run_dataset() {
   local tag
   tag="$(make_tag)"
   local result_dir="./results/${dataset_name}/${EXP_TITLE}"
-  local table_out="${result_dir}/${dataset_name}_${tag}_metrics.csv"
-
   mkdir -p "$result_dir"
-  echo "scene,variant,SSIM,PSNR,LPIPS,G_before,G_after" > "$table_out"
+  local -a run_tables=()
 
-  for scene in "${scenes[@]}"; do
-    run_scene "$dataset_name" "$dataset_root" "$scene" "$images_dir" "$table_out"
+  for run_idx in $(seq 1 "$RUNS"); do
+    local run_seed=$((RSS_SEED_BASE + run_idx - 1))
+    local table_out="${result_dir}/${dataset_name}_${tag}_run${run_idx}_metrics.csv"
+    run_tables+=("$table_out")
+    echo "scene,variant,SSIM,PSNR,LPIPS,G_before,G_after" > "$table_out"
+
+    for scene in "${scenes[@]}"; do
+      run_scene "$dataset_name" "$dataset_root" "$scene" "$images_dir" "$table_out" "$run_idx" "$run_seed"
+    done
+
+    CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" python scripts/collect_metrics.py average "$table_out"
+    echo "Metrics table written to $table_out"
   done
 
-  CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" python scripts/collect_metrics.py average "$table_out"
-  echo "Metrics table written to $table_out"
+  local summary_out="${result_dir}/${dataset_name}_${tag}_runs_mean_std.csv"
+  CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" python scripts/collect_metrics.py aggregate "$summary_out" "${run_tables[@]}" --only_average
+  echo "Run summary written to $summary_out"
 }
 
 # Tanks & Temples
@@ -217,14 +236,22 @@ run_dataset "deep_blending" "$DEEP_ROOT" "images" "${DEEP_SCENES[@]}"
 # MipNeRF360: outdoor (images_4) + indoor (images_2) in one table
 MIP_RESULT_DIR="./results/mipnerf360/${EXP_TITLE}"
 MIP_TAG="$(make_tag)"
-MIP_TABLE_OUT="${MIP_RESULT_DIR}/mipnerf360_${MIP_TAG}_metrics.csv"
 mkdir -p "$MIP_RESULT_DIR"
-echo "scene,variant,SSIM,PSNR,LPIPS,G_before,G_after" > "$MIP_TABLE_OUT"
-for scene in "${MIP_OUTDOOR_SCENES[@]}"; do
-  run_scene "mipnerf360" "$MIP_ROOT" "$scene" "images_4" "$MIP_TABLE_OUT"
+MIP_TABLES=()
+for run_idx in $(seq 1 "$RUNS"); do
+  run_seed=$((RSS_SEED_BASE + run_idx - 1))
+  MIP_TABLE_OUT="${MIP_RESULT_DIR}/mipnerf360_${MIP_TAG}_run${run_idx}_metrics.csv"
+  MIP_TABLES+=("$MIP_TABLE_OUT")
+  echo "scene,variant,SSIM,PSNR,LPIPS,G_before,G_after" > "$MIP_TABLE_OUT"
+  for scene in "${MIP_OUTDOOR_SCENES[@]}"; do
+    run_scene "mipnerf360" "$MIP_ROOT" "$scene" "images_4" "$MIP_TABLE_OUT" "$run_idx" "$run_seed"
+  done
+  for scene in "${MIP_INDOOR_SCENES[@]}"; do
+    run_scene "mipnerf360" "$MIP_ROOT" "$scene" "images_2" "$MIP_TABLE_OUT" "$run_idx" "$run_seed"
+  done
+  CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" python scripts/collect_metrics.py average "$MIP_TABLE_OUT"
+  echo "Metrics table written to $MIP_TABLE_OUT"
 done
-for scene in "${MIP_INDOOR_SCENES[@]}"; do
-  run_scene "mipnerf360" "$MIP_ROOT" "$scene" "images_2" "$MIP_TABLE_OUT"
-done
-CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" python scripts/collect_metrics.py average "$MIP_TABLE_OUT"
-echo "Metrics table written to $MIP_TABLE_OUT"
+MIP_SUMMARY_OUT="${MIP_RESULT_DIR}/mipnerf360_${MIP_TAG}_runs_mean_std.csv"
+CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" python scripts/collect_metrics.py aggregate "$MIP_SUMMARY_OUT" "${MIP_TABLES[@]}" --only_average
+echo "Run summary written to $MIP_SUMMARY_OUT"
