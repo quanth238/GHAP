@@ -82,6 +82,12 @@ def main() -> None:
     parser.add_argument("--max_samples", default=200000, type=int)
     parser.add_argument("--seed", default=42, type=int)
     parser.add_argument("--out_dir", default=None, type=str)
+    parser.add_argument(
+        "--rho_thresholds",
+        default="0.3,0.5,0.7",
+        type=str,
+        help="Comma-separated dominance thresholds for per-bin summaries.",
+    )
     parser.add_argument("--no_plot", action="store_true")
     args = get_combined_args(parser)
 
@@ -101,6 +107,7 @@ def main() -> None:
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
         teacher_xyz = gaussians.get_xyz.detach().cpu().numpy()
+        teacher_scale = gaussians.get_scaling.detach().cpu().numpy()
         tree = cKDTree(teacher_xyz)
 
         views = scene.getTrainCameras()
@@ -109,7 +116,10 @@ def main() -> None:
         dist_dom = []
         dist_nn = []
         ratio = []
+        ratio_norm = []
         matches = []
+        rho_vals = []
+        sum_w_vals = []
 
         for idx in view_indices:
             view = views[int(idx)]
@@ -168,12 +178,21 @@ def main() -> None:
             d_nn = d_nn.astype(np.float32)
 
             r = d_dom / (d_nn + 1e-8)
+            rho = (max_w[ys, xs] / (sum_w[ys, xs] + 1e-8)).detach().cpu().numpy()
             match = (idx_nn == ids.detach().cpu().numpy())
+
+            dom_scale = teacher_scale[ids.detach().cpu().numpy()]
+            dom_scale = np.maximum(dom_scale, 1e-8)
+            dom_scale_geom = np.cbrt(dom_scale[:, 0] * dom_scale[:, 1] * dom_scale[:, 2])
+            r_norm = d_dom / (dom_scale_geom + 1e-8)
 
             dist_dom.append(d_dom.astype(np.float32))
             dist_nn.append(d_nn)
             ratio.append(r.astype(np.float32))
+            ratio_norm.append(r_norm.astype(np.float32))
             matches.append(match.astype(np.float32))
+            rho_vals.append(rho.astype(np.float32))
+            sum_w_vals.append(sum_w[ys, xs].detach().cpu().numpy().astype(np.float32))
 
         if not dist_dom:
             print("[DomSurface] No valid samples found.")
@@ -182,7 +201,10 @@ def main() -> None:
         dist_dom_np = np.concatenate(dist_dom, axis=0)
         dist_nn_np = np.concatenate(dist_nn, axis=0)
         ratio_np = np.concatenate(ratio, axis=0)
+        ratio_norm_np = np.concatenate(ratio_norm, axis=0)
         matches_np = np.concatenate(matches, axis=0)
+        rho_np = np.concatenate(rho_vals, axis=0)
+        sum_w_np = np.concatenate(sum_w_vals, axis=0)
 
         out_dir = args.out_dir or os.path.join(dataset.model_path, "dominant_surface")
         os.makedirs(out_dir, exist_ok=True)
@@ -192,15 +214,38 @@ def main() -> None:
             dist_dom=dist_dom_np,
             dist_nn=dist_nn_np,
             ratio=ratio_np,
+            ratio_norm=ratio_norm_np,
             match=matches_np,
+            rho=rho_np,
+            sum_w=sum_w_np,
         )
 
         print(f"[DomSurface] Saved stats to {out_dir}")
         _summarize("dist_dom", dist_dom_np)
         _summarize("dist_nn", dist_nn_np)
         _summarize("ratio=dist_dom/dist_nn", ratio_np)
+        _summarize("ratio_norm=dist_dom/scale_geom", ratio_norm_np)
+        median_ratio = float(np.percentile(ratio_np, 50))
         match_rate = float(matches_np.mean()) * 100.0
         print(f"[DomSurface] match_rate (dom==NN): {match_rate:.2f}%")
+        print(f"[DomSurface] ratio median: {median_ratio:.6f}")
+
+        thresholds = [float(t) for t in args.rho_thresholds.split(",") if t.strip()]
+        total_mass = float(sum_w_np.sum())
+        for tau in thresholds:
+            mask = rho_np >= tau
+            if not np.any(mask):
+                print(f"[DomSurface] rho>={tau:.2f}: empty")
+                continue
+            tau_match = float(matches_np[mask].mean()) * 100.0
+            tau_med_ratio = float(np.percentile(ratio_np[mask], 50))
+            tau_med_norm = float(np.percentile(ratio_norm_np[mask], 50))
+            tau_cover = float(sum_w_np[mask].sum()) / max(total_mass, 1e-8) * 100.0
+            print(
+                "[DomSurface] rho>={:.2f}: match={:.2f}% med_ratio={:.3f} med_norm={:.3f} mass_cover={:.2f}%".format(
+                    tau, tau_match, tau_med_ratio, tau_med_norm, tau_cover
+                )
+            )
 
         if args.no_plot:
             return
@@ -216,6 +261,7 @@ def main() -> None:
         # Ratio histogram + CDF
         fig, axes = plt.subplots(1, 2, figsize=(10, 4))
         axes[0].hist(ratio_np, bins=60, range=(0.0, 2.0), density=True)
+        axes[0].axvline(median_ratio, color="k", linestyle="--", linewidth=1.0)
         axes[0].set_title("Dominant vs NN distance ratio")
         axes[0].set_xlabel("||x_hit - mu_dom|| / ||x_hit - mu_nn||")
         axes[0].set_ylabel("Density")
@@ -226,6 +272,14 @@ def main() -> None:
         axes[1].set_title("Ratio CDF")
         axes[1].set_xlabel("||x_hit - mu_dom|| / ||x_hit - mu_nn||")
         axes[1].set_ylabel("CDF")
+        axes[1].text(
+            0.02,
+            0.05,
+            f"median={median_ratio:.3f}\nmatch={match_rate:.1f}%",
+            transform=axes[1].transAxes,
+            fontsize=9,
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+        )
 
         fig.tight_layout()
         fig.savefig(os.path.join(out_dir, "dominant_surface_ratio.png"), dpi=200)
@@ -240,6 +294,14 @@ def main() -> None:
         ax2.legend()
         fig2.tight_layout()
         fig2.savefig(os.path.join(out_dir, "dominant_surface_dist.png"), dpi=200)
+
+        fig3, ax3 = plt.subplots(1, 1, figsize=(5, 4))
+        ax3.hist(ratio_norm_np, bins=60, range=(0.0, 4.0), density=True)
+        ax3.set_title("Normalized distance (dom / scale)")
+        ax3.set_xlabel("||x_hit - mu_dom|| / scale_geom")
+        ax3.set_ylabel("Density")
+        fig3.tight_layout()
+        fig3.savefig(os.path.join(out_dir, "dominant_surface_norm.png"), dpi=200)
 
         print(f"[DomSurface] Plots written to {out_dir}")
 

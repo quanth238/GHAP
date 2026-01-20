@@ -20,6 +20,7 @@ HIT_QUANTILE="${HIT_QUANTILE:-0.3}"
 PIXEL_STRIDE="${PIXEL_STRIDE:-2}"
 MAX_SAMPLES="${MAX_SAMPLES:-200000}"
 SEED="${SEED:-42}"
+RHO_THRESHOLDS="${RHO_THRESHOLDS:-0.3,0.5,0.7}"
 
 OUT_BASE="${OUT_BASE:-./results/mipnerf360/dominant_surface_${EXP_TITLE}}"
 
@@ -70,6 +71,7 @@ run_scene() {
     --pixel_stride "$PIXEL_STRIDE" \
     --max_samples "$MAX_SAMPLES" \
     --seed "$SEED" \
+    --rho_thresholds "$RHO_THRESHOLDS" \
     --out_dir "$out_dir"
 }
 
