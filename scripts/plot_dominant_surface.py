@@ -14,6 +14,13 @@ from argparse import ArgumentParser
 import numpy as np
 import torch
 
+import sys
+
+# Ensure repo root is on sys.path for local imports.
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel, render
 from scene import Scene
@@ -70,6 +77,155 @@ def _summarize(name: str, values: np.ndarray) -> None:
     )
 
 
+def _flatten_matrix(mat: torch.Tensor) -> np.ndarray:
+    # Match CUDA column-major layout: the tensor already stores W2C^T / P^T.
+    return mat.detach().cpu().numpy().reshape(-1)
+
+
+def _transform_point4x3(points: np.ndarray, mat_flat: np.ndarray) -> np.ndarray:
+    x = mat_flat[0] * points[:, 0] + mat_flat[4] * points[:, 1] + mat_flat[8] * points[:, 2] + mat_flat[12]
+    y = mat_flat[1] * points[:, 0] + mat_flat[5] * points[:, 1] + mat_flat[9] * points[:, 2] + mat_flat[13]
+    z = mat_flat[2] * points[:, 0] + mat_flat[6] * points[:, 1] + mat_flat[10] * points[:, 2] + mat_flat[14]
+    return np.stack([x, y, z], axis=1)
+
+
+def _transform_point4x4(points: np.ndarray, mat_flat: np.ndarray) -> np.ndarray:
+    x = mat_flat[0] * points[:, 0] + mat_flat[4] * points[:, 1] + mat_flat[8] * points[:, 2] + mat_flat[12]
+    y = mat_flat[1] * points[:, 0] + mat_flat[5] * points[:, 1] + mat_flat[9] * points[:, 2] + mat_flat[13]
+    z = mat_flat[2] * points[:, 0] + mat_flat[6] * points[:, 1] + mat_flat[10] * points[:, 2] + mat_flat[14]
+    w = mat_flat[3] * points[:, 0] + mat_flat[7] * points[:, 1] + mat_flat[11] * points[:, 2] + mat_flat[15]
+    return np.stack([x, y, z, w], axis=1)
+
+
+def _ndc2pix(v: np.ndarray, size: int) -> np.ndarray:
+    return ((v + 1.0) * size - 1.0) * 0.5
+
+
+def _compute_cov3d(scales: np.ndarray, rotations: np.ndarray) -> np.ndarray:
+    r = rotations[:, 0]
+    x = rotations[:, 1]
+    y = rotations[:, 2]
+    z = rotations[:, 3]
+
+    r2 = r * r
+    x2 = x * x
+    y2 = y * y
+    z2 = z * z
+
+    R00 = 1.0 - 2.0 * (y2 + z2)
+    R01 = 2.0 * (x * y - r * z)
+    R02 = 2.0 * (x * z + r * y)
+    R10 = 2.0 * (x * y + r * z)
+    R11 = 1.0 - 2.0 * (x2 + z2)
+    R12 = 2.0 * (y * z - r * x)
+    R20 = 2.0 * (x * z - r * y)
+    R21 = 2.0 * (y * z + r * x)
+    R22 = 1.0 - 2.0 * (x2 + y2)
+
+    sx = scales[:, 0]
+    sy = scales[:, 1]
+    sz = scales[:, 2]
+
+    M00 = sx * R00
+    M01 = sx * R01
+    M02 = sx * R02
+    M10 = sy * R10
+    M11 = sy * R11
+    M12 = sy * R12
+    M20 = sz * R20
+    M21 = sz * R21
+    M22 = sz * R22
+
+    sigma00 = M00 * M00 + M10 * M10 + M20 * M20
+    sigma01 = M00 * M01 + M10 * M11 + M20 * M21
+    sigma02 = M00 * M02 + M10 * M12 + M20 * M22
+    sigma11 = M01 * M01 + M11 * M11 + M21 * M21
+    sigma12 = M01 * M02 + M11 * M12 + M21 * M22
+    sigma22 = M02 * M02 + M12 * M12 + M22 * M22
+
+    cov = np.stack([sigma00, sigma01, sigma02, sigma11, sigma12, sigma22], axis=1)
+    return cov
+
+
+def _compute_conic_and_center(
+    means: np.ndarray,
+    scales: np.ndarray,
+    rotations: np.ndarray,
+    view,
+    h_var: float = 0.3,
+) -> tuple[np.ndarray, np.ndarray]:
+    W = int(view.image_width)
+    H = int(view.image_height)
+    tan_fovx = float(np.tan(view.FoVx * 0.5))
+    tan_fovy = float(np.tan(view.FoVy * 0.5))
+    focal_x = float(fov2focal(view.FoVx, view.image_width))
+    focal_y = float(fov2focal(view.FoVy, view.image_height))
+
+    view_flat = _flatten_matrix(view.world_view_transform)
+    proj_flat = _flatten_matrix(view.full_proj_transform)
+
+    t = _transform_point4x3(means, view_flat)
+    t_z = np.maximum(t[:, 2], 1e-6)
+    limx = 1.3 * tan_fovx
+    limy = 1.3 * tan_fovy
+    txtz = t[:, 0] / t_z
+    tytz = t[:, 1] / t_z
+    t[:, 0] = np.clip(txtz, -limx, limx) * t_z
+    t[:, 1] = np.clip(tytz, -limy, limy) * t_z
+
+    J00 = focal_x / t_z
+    J02 = -(focal_x * t[:, 0]) / np.maximum(t_z * t_z, 1e-8)
+    J11 = focal_y / t_z
+    J12 = -(focal_y * t[:, 1]) / np.maximum(t_z * t_z, 1e-8)
+
+    Wmat = np.array(
+        [
+            [view_flat[0], view_flat[4], view_flat[8]],
+            [view_flat[1], view_flat[5], view_flat[9]],
+            [view_flat[2], view_flat[6], view_flat[10]],
+        ],
+        dtype=np.float32,
+    )
+
+    # T = W * J, J has only 4 non-zero entries.
+    T = np.zeros((means.shape[0], 3, 3), dtype=np.float32)
+    T[:, 0, 0] = Wmat[0, 0] * J00 + Wmat[0, 2] * 0.0
+    T[:, 0, 1] = Wmat[0, 1] * J11 + Wmat[0, 2] * 0.0
+    T[:, 0, 2] = Wmat[0, 0] * J02 + Wmat[0, 1] * J12 + Wmat[0, 2] * 0.0
+    T[:, 1, 0] = Wmat[1, 0] * J00 + Wmat[1, 2] * 0.0
+    T[:, 1, 1] = Wmat[1, 1] * J11 + Wmat[1, 2] * 0.0
+    T[:, 1, 2] = Wmat[1, 0] * J02 + Wmat[1, 1] * J12 + Wmat[1, 2] * 0.0
+    T[:, 2, 0] = Wmat[2, 0] * J00 + Wmat[2, 2] * 0.0
+    T[:, 2, 1] = Wmat[2, 1] * J11 + Wmat[2, 2] * 0.0
+    T[:, 2, 2] = Wmat[2, 0] * J02 + Wmat[2, 1] * J12 + Wmat[2, 2] * 0.0
+
+    cov3d = _compute_cov3d(scales, rotations)
+    Vrk = np.zeros((means.shape[0], 3, 3), dtype=np.float32)
+    Vrk[:, 0, 0] = cov3d[:, 0]
+    Vrk[:, 0, 1] = cov3d[:, 1]
+    Vrk[:, 0, 2] = cov3d[:, 2]
+    Vrk[:, 1, 0] = cov3d[:, 1]
+    Vrk[:, 1, 1] = cov3d[:, 3]
+    Vrk[:, 1, 2] = cov3d[:, 4]
+    Vrk[:, 2, 0] = cov3d[:, 2]
+    Vrk[:, 2, 1] = cov3d[:, 4]
+    Vrk[:, 2, 2] = cov3d[:, 5]
+
+    cov2d = np.einsum("bij,bjk,bkl->bil", np.transpose(T, (0, 2, 1)), Vrk, T)
+    cov_xx = cov2d[:, 0, 0] + h_var
+    cov_xy = cov2d[:, 0, 1]
+    cov_yy = cov2d[:, 1, 1] + h_var
+    det = cov_xx * cov_yy - cov_xy * cov_xy
+    det = np.maximum(det, 1e-12)
+    conic = np.stack([cov_yy / det, -cov_xy / det, cov_xx / det], axis=1)
+
+    p_hom = _transform_point4x4(means, proj_flat)
+    p_w = 1.0 / (p_hom[:, 3] + 1e-7)
+    p_proj = p_hom[:, :3] * p_w[:, None]
+    center = np.stack([_ndc2pix(p_proj[:, 0], W), _ndc2pix(p_proj[:, 1], H)], axis=1)
+    return conic.astype(np.float32), center.astype(np.float32)
+
+
 def main() -> None:
     parser = ArgumentParser(description="Dominant-to-surface proximity analysis.")
     model = ModelParams(parser, sentinel=True)
@@ -87,6 +243,12 @@ def main() -> None:
         default="0.3,0.5,0.7",
         type=str,
         help="Comma-separated dominance thresholds for per-bin summaries.",
+    )
+    parser.add_argument(
+        "--maha_thresholds",
+        default="1.0,2.0,3.0",
+        type=str,
+        help="Comma-separated Mahalanobis radius thresholds for weighted containment.",
     )
     parser.add_argument("--no_plot", action="store_true")
     args = get_combined_args(parser)
@@ -108,6 +270,7 @@ def main() -> None:
 
         teacher_xyz = gaussians.get_xyz.detach().cpu().numpy()
         teacher_scale = gaussians.get_scaling.detach().cpu().numpy()
+        teacher_rot = gaussians.get_rotation.detach().cpu().numpy()
         tree = cKDTree(teacher_xyz)
 
         views = scene.getTrainCameras()
@@ -120,6 +283,7 @@ def main() -> None:
         matches = []
         rho_vals = []
         sum_w_vals = []
+        maha_vals = []
 
         for idx in view_indices:
             view = views[int(idx)]
@@ -187,6 +351,25 @@ def main() -> None:
             dom_scale_geom = np.cbrt(dom_scale[:, 0] * dom_scale[:, 1] * dom_scale[:, 2])
             r_norm = d_dom / (dom_scale_geom + 1e-8)
 
+            # 2D Mahalanobis distance using screen-space conic.
+            ids_np = ids.detach().cpu().numpy()
+            uniq_ids, inv = np.unique(ids_np, return_inverse=True)
+            conic, centers = _compute_conic_and_center(
+                teacher_xyz[uniq_ids],
+                teacher_scale[uniq_ids],
+                teacher_rot[uniq_ids],
+                view,
+            )
+            centers = centers[inv]
+            conic = conic[inv]
+            u_np = u.detach().cpu().numpy()
+            v_np = v.detach().cpu().numpy()
+            dx = u_np - centers[:, 0]
+            dy = v_np - centers[:, 1]
+            d2 = conic[:, 0] * dx * dx + 2.0 * conic[:, 1] * dx * dy + conic[:, 2] * dy * dy
+            d2 = np.maximum(d2, 0.0)
+            maha_vals.append(np.sqrt(d2).astype(np.float32))
+
             dist_dom.append(d_dom.astype(np.float32))
             dist_nn.append(d_nn)
             ratio.append(r.astype(np.float32))
@@ -206,6 +389,7 @@ def main() -> None:
         matches_np = np.concatenate(matches, axis=0)
         rho_np = np.concatenate(rho_vals, axis=0)
         sum_w_np = np.concatenate(sum_w_vals, axis=0)
+        maha_np = np.concatenate(maha_vals, axis=0)
 
         out_dir = args.out_dir or os.path.join(dataset.model_path, "dominant_surface")
         os.makedirs(out_dir, exist_ok=True)
@@ -219,6 +403,7 @@ def main() -> None:
             match=matches_np,
             rho=rho_np,
             sum_w=sum_w_np,
+            maha=maha_np,
         )
 
         print(f"[DomSurface] Saved stats to {out_dir}")
@@ -226,12 +411,14 @@ def main() -> None:
         _summarize("dist_nn", dist_nn_np)
         _summarize("ratio=dist_dom/dist_nn", ratio_np)
         _summarize("ratio_norm=dist_dom/scale_geom", ratio_norm_np)
+        _summarize("maha_2d", maha_np)
         median_ratio = float(np.percentile(ratio_np, 50))
         match_rate = float(matches_np.mean()) * 100.0
         print(f"[DomSurface] match_rate (dom==NN): {match_rate:.2f}%")
         print(f"[DomSurface] ratio median: {median_ratio:.6f}")
 
         thresholds = [float(t) for t in args.rho_thresholds.split(",") if t.strip()]
+        maha_thresholds = [float(t) for t in args.maha_thresholds.split(",") if t.strip()]
         total_mass = float(sum_w_np.sum())
         for tau in thresholds:
             mask = rho_np >= tau
@@ -242,11 +429,19 @@ def main() -> None:
             tau_med_ratio = float(np.percentile(ratio_np[mask], 50))
             tau_med_norm = float(np.percentile(ratio_norm_np[mask], 50))
             tau_cover = float(sum_w_np[mask].sum()) / max(total_mass, 1e-8) * 100.0
+            tau_maha_med = float(np.percentile(maha_np[mask], 50))
+            tau_maha_p90 = float(np.percentile(maha_np[mask], 90))
             print(
-                "[DomSurface] rho>={:.2f}: match={:.2f}% med_ratio={:.3f} med_norm={:.3f} mass_cover={:.2f}%".format(
-                    tau, tau_match, tau_med_ratio, tau_med_norm, tau_cover
+                "[DomSurface] rho>={:.2f}: match={:.2f}% med_ratio={:.3f} med_norm={:.3f} "
+                "med_maha={:.3f} p90_maha={:.3f} mass_cover={:.2f}%".format(
+                    tau, tau_match, tau_med_ratio, tau_med_norm, tau_maha_med, tau_maha_p90, tau_cover
                 )
             )
+
+        if maha_thresholds:
+            for r_thr in maha_thresholds:
+                cover = float(sum_w_np[maha_np <= r_thr].sum()) / max(total_mass, 1e-8) * 100.0
+                print(f"[DomSurface] mass_cover(d_maha<= {r_thr:.2f}) = {cover:.2f}%")
 
         if args.no_plot:
             return
@@ -259,50 +454,14 @@ def main() -> None:
             print(f"[DomSurface] matplotlib unavailable ({exc}); skipping plots.")
             return
 
-        # Ratio histogram + CDF
-        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-        axes[0].hist(ratio_np, bins=60, range=(0.0, 2.0), density=True)
-        axes[0].axvline(median_ratio, color="k", linestyle="--", linewidth=1.0)
-        axes[0].set_title("Dominant vs NN distance ratio")
-        axes[0].set_xlabel("||x_hit - mu_dom|| / ||x_hit - mu_nn||")
-        axes[0].set_ylabel("Density")
-
-        sorted_ratio = np.sort(ratio_np)
-        cdf = np.linspace(0.0, 1.0, sorted_ratio.shape[0], endpoint=True)
-        axes[1].plot(sorted_ratio, cdf)
-        axes[1].set_title("Ratio CDF")
-        axes[1].set_xlabel("||x_hit - mu_dom|| / ||x_hit - mu_nn||")
-        axes[1].set_ylabel("CDF")
-        axes[1].text(
-            0.02,
-            0.05,
-            f"median={median_ratio:.3f}\nmatch={match_rate:.1f}%",
-            transform=axes[1].transAxes,
-            fontsize=9,
-            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
-        )
-
+        # Single figure: 2D Mahalanobis distance histogram (dominant anchor validity)
+        fig, ax = plt.subplots(1, 1, figsize=(5, 4))
+        ax.hist(maha_np, bins=60, range=(0.0, 6.0), density=True)
+        ax.set_title("2D Mahalanobis distance (dominant)")
+        ax.set_xlabel("sqrt((x-μ)^T Σ^{-1} (x-μ))")
+        ax.set_ylabel("Density")
         fig.tight_layout()
-        fig.savefig(os.path.join(out_dir, "dominant_surface_ratio.png"), dpi=200)
-
-        # Distance comparison histogram
-        fig2, ax2 = plt.subplots(1, 1, figsize=(5, 4))
-        ax2.hist(dist_dom_np, bins=60, alpha=0.6, density=True, label="dist_dom")
-        ax2.hist(dist_nn_np, bins=60, alpha=0.6, density=True, label="dist_nn")
-        ax2.set_title("Distance to hit point")
-        ax2.set_xlabel("Distance")
-        ax2.set_ylabel("Density")
-        ax2.legend()
-        fig2.tight_layout()
-        fig2.savefig(os.path.join(out_dir, "dominant_surface_dist.png"), dpi=200)
-
-        fig3, ax3 = plt.subplots(1, 1, figsize=(5, 4))
-        ax3.hist(ratio_norm_np, bins=60, range=(0.0, 4.0), density=True)
-        ax3.set_title("Normalized distance (dom / scale)")
-        ax3.set_xlabel("||x_hit - mu_dom|| / scale_geom")
-        ax3.set_ylabel("Density")
-        fig3.tight_layout()
-        fig3.savefig(os.path.join(out_dir, "dominant_surface_norm.png"), dpi=200)
+        fig.savefig(os.path.join(out_dir, "dominant_surface_maha2d.png"), dpi=200)
 
         print(f"[DomSurface] Plots written to {out_dir}")
 
