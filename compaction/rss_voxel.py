@@ -400,6 +400,17 @@ def _search_voxel_size(
     return s_high
 
 
+def _topk_indices(values: np.ndarray, k: int) -> np.ndarray:
+    values = np.asarray(values).reshape(-1)
+    if values.size == 0 or k <= 0:
+        return np.zeros((0,), dtype=np.int64)
+    k = min(k, values.shape[0])
+    if k >= values.shape[0]:
+        return np.arange(values.shape[0], dtype=np.int64)
+    kth = values.shape[0] - k
+    return np.argpartition(values, kth)[-k:]
+
+
 def _select_centers(points: np.ndarray, weights: np.ndarray, cfg: RSSVoxelConfig) -> Tuple[np.ndarray, float]:
     if points.shape[0] == 0:
         raise ValueError("No surface samples collected.")
@@ -430,7 +441,7 @@ def _select_centers(points: np.ndarray, weights: np.ndarray, cfg: RSSVoxelConfig
             if centers.shape[0] >= cfg.target_num_gaussians:
                 break
     if centers.shape[0] > cfg.target_num_gaussians:
-        keep = np.argpartition(mass, -cfg.target_num_gaussians)[-cfg.target_num_gaussians:]
+        keep = _topk_indices(mass, cfg.target_num_gaussians)
         centers = centers[keep]
 
     return centers.astype(np.float32), voxel_size
@@ -475,7 +486,7 @@ def _select_teacher_ids(
     selected = base_ids
     if selected.shape[0] > cfg.target_num_gaussians:
         base_mass = mass[selected]
-        keep = np.argpartition(base_mass, -cfg.target_num_gaussians)[-cfg.target_num_gaussians:]
+        keep = _topk_indices(base_mass, cfg.target_num_gaussians)
         selected = selected[keep]
         stats["trimmed"] = float(base_ids.shape[0] - selected.shape[0])
     elif selected.shape[0] < cfg.target_num_gaussians:
@@ -507,7 +518,7 @@ def _select_teacher_ids_topk(
     if mass.shape[0] <= cfg.target_num_gaussians:
         selected = np.arange(mass.shape[0], dtype=np.int64)
     else:
-        selected = np.argpartition(mass, -cfg.target_num_gaussians)[-cfg.target_num_gaussians:]
+        selected = _topk_indices(mass, cfg.target_num_gaussians)
 
     min_xyz = teacher_xyz.min(axis=0)
     max_xyz = teacher_xyz.max(axis=0)
@@ -624,7 +635,7 @@ def _select_teacher_ids_octree(
 
     if selected.shape[0] > cfg.target_num_gaussians:
         before = selected.shape[0]
-        keep = np.argpartition(leaf_masses, -cfg.target_num_gaussians)[-cfg.target_num_gaussians:]
+        keep = _topk_indices(leaf_masses, cfg.target_num_gaussians)
         selected = selected[keep]
         stats["trimmed"] = float(before - selected.shape[0])
     elif selected.shape[0] < cfg.target_num_gaussians:
@@ -670,7 +681,7 @@ def build_student_from_rss_voxel(
         mass = np.zeros((teacher_xyz.shape[0],), dtype=np.float32)
         if cfg.mass_source == "opacity":
             teacher_opacity = gaussians.get_opacity.detach().cpu().numpy().astype(np.float32)
-            mass = teacher_opacity.copy()
+            mass = teacher_opacity.reshape(-1).copy()
             timings["render_sampling"] = 0.0
             timings["num_samples_raw"] = 0.0
             timings["num_samples"] = 0.0
