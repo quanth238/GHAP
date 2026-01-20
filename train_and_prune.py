@@ -243,6 +243,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             center_mode=compaction.rss_center_mode,
                             teacher_selector=compaction.rss_teacher_selector,
                             mass_source=compaction.rss_mass_source,
+                            mass_topk=compaction.rss_mass_topk,
                             no_reset=compaction.rss_no_reset,
                             voxel_search=compaction.rss_voxel_search,
                             voxel_search_iters=compaction.rss_voxel_search_iters,
@@ -530,6 +531,7 @@ if __name__ == "__main__":
     parser.add_argument("--rss_center_mode", type=str, default="mean", choices=["mean", "representative", "teacher"])
     parser.add_argument("--rss_teacher_selector", type=str, default="voxel", choices=["voxel", "octree", "topk"])
     parser.add_argument("--rss_mass_source", type=str, default="dominant", choices=["dominant", "opacity"])
+    parser.add_argument("--rss_mass_topk", type=int, default=1)
     parser.add_argument("--rss_no_reset", action="store_true", default=False)
     parser.add_argument("--rss_debug", action="store_true", default=False)
     parser.add_argument("--rss_debug_samples", type=int, default=10000)
@@ -574,6 +576,7 @@ if __name__ == "__main__":
             rss_center_mode,
             rss_teacher_selector,
             rss_mass_source,
+            rss_mass_topk,
             rss_no_reset,
             rss_debug,
             rss_debug_samples,
@@ -607,6 +610,7 @@ if __name__ == "__main__":
             self.rss_center_mode = rss_center_mode
             self.rss_teacher_selector = rss_teacher_selector
             self.rss_mass_source = rss_mass_source
+            self.rss_mass_topk = rss_mass_topk
             self.rss_no_reset = rss_no_reset
             self.rss_debug = rss_debug
             self.rss_debug_samples = rss_debug_samples
@@ -638,6 +642,7 @@ if __name__ == "__main__":
         args.rss_center_mode,
         args.rss_teacher_selector,
         args.rss_mass_source,
+        args.rss_mass_topk,
         args.rss_no_reset,
         args.rss_debug,
         args.rss_debug_samples,

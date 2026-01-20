@@ -34,6 +34,7 @@ if [[ "$COMPACTION_METHOD" == "rss_voxel" ]]; then
   COMMON_COMPACT_ARGS+=(
     --rss_center_mode teacher
     --rss_teacher_selector octree
+    --rss_num_views 9999
     --rss_alpha_tau 0.02
     --rss_hit_quantile 0.3
     --rss_lambda_tex 0.5

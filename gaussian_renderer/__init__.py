@@ -15,7 +15,19 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, return_stats=False, hit_quantile=0.5):
+def render(
+    viewpoint_camera,
+    pc: GaussianModel,
+    pipe,
+    bg_color: torch.Tensor,
+    scaling_modifier=1.0,
+    separate_sh=False,
+    override_color=None,
+    use_trained_exp=False,
+    return_stats=False,
+    hit_quantile=0.5,
+    topk_contrib=1,
+):
     """
     Render the scene. 
     
@@ -48,7 +60,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         debug=pipe.debug,
         antialiasing=pipe.antialiasing,
         return_stats=return_stats,
-        hit_quantile=hit_quantile
+        hit_quantile=hit_quantile,
+        topk_contrib=topk_contrib,
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
@@ -140,8 +153,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         mean_z = sum_wz / (sum_w + eps)
         var_z = sum_wz2 / (sum_w + eps) - mean_z * mean_z
         var_z = torch.clamp(var_z, min=0.0)
-        max_w = max_w[0]
-        max_id = max_id[0]
+        if max_w.dim() == 3 and max_w.shape[0] == 1:
+            max_w = max_w[0]
+        if max_id.dim() == 3 and max_id.shape[0] == 1:
+            max_id = max_id[0]
         out.update({
             "opacity": sum_w,
             "depth_hit": hit_depth,
