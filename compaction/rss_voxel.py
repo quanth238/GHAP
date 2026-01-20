@@ -34,6 +34,8 @@ class RSSVoxelConfig:
     seed: int
     center_mode: str = "mean"
     teacher_selector: str = "voxel"
+    mass_source: str = "dominant"
+    no_reset: bool = False
     world_bound_scale: float = 4.0
     bbox_percentiles: Tuple[float, float] = (1.0, 99.0)
     min_centers_frac: float = 0.7
@@ -490,6 +492,38 @@ def _select_teacher_ids(
     return selected.astype(np.int64), voxel_size, stats
 
 
+def _select_teacher_ids_topk(
+    teacher_xyz: np.ndarray,
+    mass: np.ndarray,
+    cfg: RSSVoxelConfig,
+) -> Tuple[np.ndarray, float, Dict[str, float]]:
+    if teacher_xyz.shape[0] == 0:
+        raise ValueError("Teacher has 0 Gaussians.")
+
+    mass = np.nan_to_num(mass, nan=0.0, posinf=0.0, neginf=0.0)
+    if mass.sum() <= 0:
+        raise RuntimeError("Teacher-space resampling collected 0 mass across views.")
+
+    if mass.shape[0] <= cfg.target_num_gaussians:
+        selected = np.arange(mass.shape[0], dtype=np.int64)
+    else:
+        selected = np.argpartition(mass, -cfg.target_num_gaussians)[-cfg.target_num_gaussians:]
+
+    min_xyz = teacher_xyz.min(axis=0)
+    max_xyz = teacher_xyz.max(axis=0)
+    if cfg.voxel_search:
+        voxel_size = _search_voxel_size(
+            teacher_xyz, min_xyz, max_xyz, cfg.target_num_gaussians, cfg.voxel_search_iters
+        )
+    else:
+        voxel_size = cfg.voxel_size if cfg.voxel_size > 0 else _search_voxel_size(
+            teacher_xyz, min_xyz, max_xyz, cfg.target_num_gaussians, cfg.voxel_search_iters
+        )
+
+    stats = {"selected": float(selected.shape[0])}
+    return selected.astype(np.int64), float(voxel_size), stats
+
+
 def _select_teacher_ids_octree(
     teacher_xyz: np.ndarray,
     mass: np.ndarray,
@@ -634,48 +668,60 @@ def build_student_from_rss_voxel(
     if use_teacher_resample:
         teacher_xyz = gaussians.get_xyz.detach().cpu().numpy()
         mass = np.zeros((teacher_xyz.shape[0],), dtype=np.float32)
-        render_time = 0.0
-        num_valid = 0
+        if cfg.mass_source == "opacity":
+            teacher_opacity = gaussians.get_opacity.detach().cpu().numpy().astype(np.float32)
+            mass = teacher_opacity.copy()
+            timings["render_sampling"] = 0.0
+            timings["num_samples_raw"] = 0.0
+            timings["num_samples"] = 0.0
+        elif cfg.mass_source == "dominant":
+            render_time = 0.0
+            num_valid = 0
 
-        for idx in view_indices:
-            view = cams[int(idx)]
-            t0 = time.time()
-            render_pkg = _render_stats(view, gaussians, pipe, separate_sh, cfg.hit_quantile)
-            render_time += time.time() - t0
+            for idx in view_indices:
+                view = cams[int(idx)]
+                t0 = time.time()
+                render_pkg = _render_stats(view, gaussians, pipe, separate_sh, cfg.hit_quantile)
+                render_time += time.time() - t0
 
-            sum_w = render_pkg["opacity"]
-            max_id = render_pkg["max_id"]
-            max_w = render_pkg["max_w"]
+                sum_w = render_pkg["opacity"]
+                max_id = render_pkg["max_id"]
+                max_w = render_pkg["max_w"]
 
-            if view.alpha_mask is not None:
-                mask = view.alpha_mask[0].to(sum_w.device)
-                sum_w = sum_w * mask
-                max_w = max_w * mask
+                if view.alpha_mask is not None:
+                    mask = view.alpha_mask[0].to(sum_w.device)
+                    sum_w = sum_w * mask
+                    max_w = max_w * mask
 
-            valid = torch.logical_and(max_id >= 0, sum_w > cfg.alpha_tau)
-            valid = torch.logical_and(valid, max_w > 0)
-            num_valid += int(valid.sum().item())
+                valid = torch.logical_and(max_id >= 0, sum_w > cfg.alpha_tau)
+                valid = torch.logical_and(valid, max_w > 0)
+                num_valid += int(valid.sum().item())
 
-            if valid.any():
-                if cfg.lambda_tex > 0:
-                    tex_grad = _compute_texture_grad(view.original_image.to(sum_w.device))
-                    if view.alpha_mask is not None:
-                        tex_grad = tex_grad * mask
-                    weights = max_w[valid] * (1.0 + cfg.lambda_tex * tex_grad[valid])
-                else:
-                    weights = max_w[valid]
-                ids = max_id[valid].to(torch.int64)
-                counts = torch.bincount(ids, weights=weights, minlength=teacher_xyz.shape[0])
-                mass += counts.detach().cpu().numpy().astype(np.float32)
+                if valid.any():
+                    if cfg.lambda_tex > 0:
+                        tex_grad = _compute_texture_grad(view.original_image.to(sum_w.device))
+                        if view.alpha_mask is not None:
+                            tex_grad = tex_grad * mask
+                        weights = max_w[valid] * (1.0 + cfg.lambda_tex * tex_grad[valid])
+                    else:
+                        weights = max_w[valid]
+                    ids = max_id[valid].to(torch.int64)
+                    counts = torch.bincount(ids, weights=weights, minlength=teacher_xyz.shape[0])
+                    mass += counts.detach().cpu().numpy().astype(np.float32)
 
-        timings["render_sampling"] = render_time
-        timings["num_samples_raw"] = float(num_valid)
-        timings["num_samples"] = float(num_valid)
+            timings["render_sampling"] = render_time
+            timings["num_samples_raw"] = float(num_valid)
+            timings["num_samples"] = float(num_valid)
+        else:
+            raise ValueError(f"Unknown rss_mass_source: {cfg.mass_source}")
+
         if mass.sum() <= 0:
             raise RuntimeError("Teacher-space resampling collected 0 mass across views.")
 
         t0 = time.time()
-        if cfg.teacher_selector == "octree":
+        if cfg.teacher_selector == "topk":
+            selected_ids, voxel_size, sel_stats = _select_teacher_ids_topk(teacher_xyz, mass, cfg)
+        elif cfg.teacher_selector == "octree":
             selected_ids, voxel_size, sel_stats = _select_teacher_ids_octree(teacher_xyz, mass, cfg)
         else:
             selected_ids, voxel_size, sel_stats = _select_teacher_ids(teacher_xyz, mass, cfg)
@@ -943,13 +989,18 @@ def build_student_from_rss_voxel(
 
         min_scale = max(voxel_size * 0.1, 1e-4)
         max_scale = max(voxel_size * 4.0, min_scale * 2.0)
-        clamped_scaling = torch.clamp(teacher_scaling, min=min_scale, max=max_scale)
-        new_scaling = torch.log(clamped_scaling)
-
         op_min = 0.05
         op_max = 0.9
-        clamped_opacity = torch.clamp(teacher_opacity, min=op_min, max=op_max)
-        new_opacity = inverse_sigmoid(clamped_opacity)
+        if cfg.no_reset:
+            new_scaling = gaussians._scaling[nn_idx_t].detach().clone()
+            new_opacity = gaussians._opacity[nn_idx_t].detach().clone()
+            clamped_scaling = teacher_scaling
+            clamped_opacity = teacher_opacity
+        else:
+            clamped_scaling = torch.clamp(teacher_scaling, min=min_scale, max=max_scale)
+            new_scaling = torch.log(clamped_scaling)
+            clamped_opacity = torch.clamp(teacher_opacity, min=op_min, max=op_max)
+            new_opacity = inverse_sigmoid(clamped_opacity)
         new_rotation = teacher_rotation
         scale_low = float((teacher_scaling < min_scale).float().mean().item())
         scale_high = float((teacher_scaling > max_scale).float().mean().item())
