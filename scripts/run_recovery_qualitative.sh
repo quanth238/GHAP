@@ -217,11 +217,12 @@ run_entry() {
   local render_flag
   render_flag="$(render_flags)"
 
-  CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" python render.py --iteration "$pre_iter" -s "$src" -m "$compact_out" --eval "$render_flag"
-  CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" python render.py --iteration "$final_iter" -s "$src" -m "$compact_out" --eval "$render_flag"
-
   local qual_root="./results/qualitative_recovery/${dataset}/${scene}/${EXP_TITLE}_${tag}_run${RUN_IDX}"
+
+  CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" python render.py --iteration "$pre_iter" -s "$src" -m "$compact_out" --eval "$render_flag"
   copy_renders "$compact_out" "$RENDER_SPLIT" "${qual_root}/pre_${pre_iter}"
+
+  CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" python render.py --iteration "$final_iter" -s "$src" -m "$compact_out" --eval "$render_flag"
   copy_renders "$compact_out" "$RENDER_SPLIT" "${qual_root}/post_${final_iter}"
 
   echo "[Qual] Saved qualitative renders to ${qual_root}"

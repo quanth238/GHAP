@@ -456,7 +456,14 @@ def main() -> None:
 
         # Single figure: 2D Mahalanobis distance histogram (dominant anchor validity)
         fig, ax = plt.subplots(1, 1, figsize=(5, 4))
-        ax.hist(maha_np, bins=60, range=(0.0, 6.0), density=True)
+        hist_weights = sum_w_np if sum_w_np.size == maha_np.size else None
+        ax.hist(
+            maha_np,
+            bins=60,
+            range=(0.0, 6.0),
+            density=True,
+            weights=hist_weights,
+        )
         ax.set_title("2D Mahalanobis distance (dominant)")
         ax.set_xlabel("sqrt((x-μ)^T Σ^{-1} (x-μ))")
         ax.set_ylabel("Density")
