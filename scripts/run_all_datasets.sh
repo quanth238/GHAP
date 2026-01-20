@@ -8,7 +8,7 @@ CUDA_DEVICE="${CUDA_DEVICE:-3}"
 RUN_BASELINE="${RUN_BASELINE:-no}" # "yes" to train baseline checkpoints
 OUT_DIR="${OUT_DIR:-./experiments}"
 EXP_TITLE="${EXP_TITLE:-compact_run}"
-RUNS="${RUNS:-5}"
+RUNS="${RUNS:-1}"
 RSS_SEED_BASE="${RSS_SEED_BASE:-42}"
 
 COMPACTION_METHOD="${COMPACTION_METHOD:-rss_voxel}" # options: ghap, rss_voxel

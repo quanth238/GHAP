@@ -141,11 +141,45 @@ def summarize(name, values):
     mean = np.mean(values)
     return f"{name}: mean={mean:.6f} p50={p50:.6f} p90={p90:.6f} p95={p95:.6f} p99={p99:.6f}"
 
+def weighted_quantile(values, weights, qs):
+    order = np.argsort(values)
+    v = values[order]
+    w = np.maximum(weights[order], 0.0)
+    total = float(np.sum(w))
+    if total <= 0 or v.size == 0:
+        return [float("nan")] * len(qs)
+    cdf = np.cumsum(w) / total
+    cdf[-1] = 1.0
+    out = []
+    for q in qs:
+        q = min(max(float(q), 0.0), 1.0)
+        idx = int(np.searchsorted(cdf, q, side="left"))
+        if idx >= v.size:
+            idx = v.size - 1
+        out.append(float(v[idx]))
+    return out
+
+def summarize_weighted(name, values, weights):
+    if values.size == 0 or weights.size == 0:
+        return f"{name}: empty"
+    w = np.maximum(weights, 0.0)
+    total = float(np.sum(w))
+    if total <= 0:
+        return f"{name}: empty"
+    mean = float(np.sum(values * w) / total)
+    p50, p90, p95, p99 = weighted_quantile(values, w, [0.5, 0.9, 0.95, 0.99])
+    return (
+        f"{name}: wmean={mean:.6f} p50={p50:.6f} p90={p90:.6f} "
+        f"p95={p95:.6f} p99={p99:.6f}"
+    )
+
 lines = []
 lines.append(summarize("dist_dom", dist_dom))
 lines.append(summarize("dist_nn", dist_nn))
 lines.append(summarize("ratio=dist_dom/dist_nn", ratio))
-if maha.size:
+if maha.size and sum_w.size:
+    lines.append(summarize_weighted("maha_2d (weighted)", maha, sum_w))
+elif maha.size:
     lines.append(summarize("maha_2d", maha))
 lines.append(f"match_rate (dom==NN): {float(match.mean()) * 100.0:.2f}%")
 
@@ -156,8 +190,11 @@ if rho.size and sum_w.size:
         if not np.any(mask):
             lines.append(f"rho>={tau:.2f}: empty")
             continue
-        med_maha = float(np.percentile(maha[mask], 50)) if maha.size else float("nan")
-        p90_maha = float(np.percentile(maha[mask], 90)) if maha.size else float("nan")
+        if maha.size and sum_w.size:
+            med_maha, p90_maha = weighted_quantile(maha[mask], sum_w[mask], [0.5, 0.9])
+        else:
+            med_maha = float(np.percentile(maha[mask], 50)) if maha.size else float("nan")
+            p90_maha = float(np.percentile(maha[mask], 90)) if maha.size else float("nan")
         mass_cover = float(sum_w[mask].sum()) / max(total_mass, 1e-8) * 100.0
         lines.append(
             f"rho>={tau:.2f}: med_maha={med_maha:.3f} p90_maha={p90_maha:.3f} mass_cover={mass_cover:.2f}%"

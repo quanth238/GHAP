@@ -27,11 +27,22 @@ def _weighted_quantile(values: np.ndarray, weights: np.ndarray, qs: list) -> lis
     order = np.argsort(values)
     v = values[order]
     w = weights[order]
+    w = np.maximum(w, 0.0)
     total = float(np.sum(w))
     if total <= 0:
         return [float("nan")] * len(qs)
     cdf = np.cumsum(w) / total
-    return [float(v[np.searchsorted(cdf, q, side="left")]) for q in qs]
+    if cdf.size == 0:
+        return [float("nan")] * len(qs)
+    cdf[-1] = 1.0
+    out = []
+    for q in qs:
+        q = min(max(float(q), 0.0), 1.0)
+        idx = int(np.searchsorted(cdf, q, side="left"))
+        if idx >= v.size:
+            idx = v.size - 1
+        out.append(float(v[idx]))
+    return out
 
 
 def _format_value(value: float, precision: int) -> str:
@@ -53,6 +64,12 @@ def main() -> None:
         default="bonsai,room,train",
         type=str,
         help="Comma-separated scene names.",
+    )
+    parser.add_argument(
+        "--metric",
+        default="maha",
+        type=str,
+        help="Metric key in stats files (default: maha).",
     )
     parser.add_argument(
         "--weight_by",
@@ -90,6 +107,11 @@ def main() -> None:
     )
     parser.add_argument("--precision", default=2, type=int)
     parser.add_argument("--outfile", default="", type=str)
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print per-scene stats path and raw metric quantiles.",
+    )
     args = parser.parse_args()
 
     scenes = _parse_list(args.scenes)
@@ -103,9 +125,9 @@ def main() -> None:
             raise FileNotFoundError(f"Missing stats file: {stats_path}")
         stats = _load_stats(stats_path)
 
-        maha = stats.get("maha")
-        if maha is None:
-            raise KeyError(f"Missing 'maha' in {stats_path}")
+        metric = stats.get(args.metric)
+        if metric is None:
+            raise KeyError(f"Missing '{args.metric}' in {stats_path}")
 
         weights = None
         if args.weight_by == "sum_w":
@@ -119,25 +141,27 @@ def main() -> None:
         if args.weight_by != "none" and weights is None:
             raise KeyError(f"Missing weights for '{args.weight_by}' in {stats_path}")
 
-        mask = np.isfinite(maha)
+        metric = np.asarray(metric, dtype=np.float64)
+        mask = np.isfinite(metric)
         if weights is not None:
+            weights = np.asarray(weights, dtype=np.float64)
             mask &= np.isfinite(weights)
-        maha = maha[mask]
+        metric = metric[mask]
         if weights is not None:
             weights = weights[mask]
 
         if weights is None:
-            med, p90 = np.quantile(maha, [0.5, 0.9]).tolist()
+            med, p90 = np.quantile(metric, [0.5, 0.9]).tolist()
         else:
-            med, p90 = _weighted_quantile(maha, weights, [0.5, 0.9])
+            med, p90 = _weighted_quantile(metric, weights, [0.5, 0.9])
 
-        total_w = float(np.sum(weights)) if weights is not None else float(len(maha))
+        total_w = float(np.sum(weights)) if weights is not None else float(len(metric))
         covers = []
         for t in maha_thresholds:
             if weights is None:
-                cover = float(np.mean(maha <= t))
+                cover = float(np.mean(metric <= t))
             else:
-                cover = float(np.sum(weights[maha <= t]) / max(total_w, 1e-8))
+                cover = float(np.sum(weights[metric <= t]) / max(total_w, 1e-8))
             if args.percent:
                 cover *= 100.0
             covers.append(cover)
@@ -154,14 +178,23 @@ def main() -> None:
                     rho_stats.extend([float("nan")] * 3)
                     continue
                 if weights is None:
-                    r_med, r_p90 = np.quantile(maha[sel], [0.5, 0.9]).tolist()
+                    r_med, r_p90 = np.quantile(metric[sel], [0.5, 0.9]).tolist()
                     r_cover = float(np.mean(sel))
                 else:
-                    r_med, r_p90 = _weighted_quantile(maha[sel], weights[sel], [0.5, 0.9])
+                    r_med, r_p90 = _weighted_quantile(metric[sel], weights[sel], [0.5, 0.9])
                     r_cover = float(np.sum(weights[sel]) / max(total_w, 1e-8))
                 if args.percent:
                     r_cover *= 100.0
                 rho_stats.extend([r_med, r_p90, r_cover])
+
+        if args.debug:
+            q50 = float(np.quantile(metric, 0.5)) if metric.size else float("nan")
+            q90 = float(np.quantile(metric, 0.9)) if metric.size else float("nan")
+            print(
+                f"[DomSurface][Debug] {scene} {stats_path} "
+                f"raw_p50={q50:.6f} raw_p90={q90:.6f} "
+                f"weighted_p50={med:.6f} weighted_p90={p90:.6f}"
+            )
 
         rows.append([scene, med, p90, *covers, *rho_stats])
 

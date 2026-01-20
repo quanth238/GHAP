@@ -71,8 +71,8 @@ def main() -> None:
     except Exception as exc:
         raise RuntimeError(f"matplotlib required for plotting: {exc}") from exc
 
-    fig, ax = plt.subplots(1, 1, figsize=(6.5, 3.5))
-    colors = ["#6A1B9A", "#1E88E5", "#E53935"]
+    fig, ax = plt.subplots(1, 1, figsize=(3.6, 2.6))
+    colors = ["#4E79A7", "#F28E2B", "#E15759"]
     for scene, color in zip(scenes, colors):
         stats_path = os.path.join(args.out_base, scene, "dominant_surface_stats.npz")
         if not os.path.isfile(stats_path):
@@ -89,24 +89,29 @@ def main() -> None:
             if weights is None:
                 raise KeyError(f"Weight '{args.weight_by}' not found in {stats_path}")
 
-        ax.hist(
+        hist, edges = np.histogram(
             values,
             bins=args.bins,
             range=(0.0, args.range_max),
             density=True,
             weights=weights,
+        )
+        centers = 0.5 * (edges[:-1] + edges[1:])
+        ax.plot(
+            centers,
+            hist,
             color=color,
-            alpha=0.45,
+            linewidth=2.0,
+            alpha=0.95,
             label=scene,
         )
     ax.set_ylabel("Density")
     ax.set_xlabel("2D Mahalanobis radius")
     ax.grid(alpha=0.2, linestyle="--", linewidth=0.5)
-    ax.legend(frameon=False, ncol=3, fontsize=9, loc="upper right")
-    ax.set_title("Dominant screen-space anchor (3 scenes)")
-    fig.tight_layout()
+    ax.legend(frameon=False, fontsize=9, loc="upper right")
+    fig.subplots_adjust(left=0.14, right=0.99, bottom=0.16, top=0.99)
     out_path = os.path.join(args.out_base, args.outfile)
-    fig.savefig(out_path, dpi=200)
+    fig.savefig(out_path, dpi=400, bbox_inches="tight", pad_inches=0.0)
     print(f"[DomSurface] Wrote figure to {out_path}")
 
 
