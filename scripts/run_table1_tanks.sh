@@ -86,7 +86,7 @@ flag_supported() {
   if command -v rg >/dev/null 2>&1; then
     rg -q --fixed-strings "$flag" train_and_prune.py
   else
-    grep -q "$flag" train_and_prune.py
+    grep -q -- "$flag" train_and_prune.py
   fi
 }
 
@@ -95,7 +95,7 @@ choice_supported() {
   if command -v rg >/dev/null 2>&1; then
     rg -q "$pattern" train_and_prune.py
   else
-    grep -q "$pattern" train_and_prune.py
+    grep -q -- "$pattern" train_and_prune.py
   fi
 }
 
