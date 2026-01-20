@@ -164,8 +164,9 @@ def main() -> None:
                 ys = ys[choice]
                 xs = xs[choice]
 
-            u = xs.float()
-            v = ys.float()
+            stride = max(int(args.pixel_stride), 1)
+            u = xs.float() * stride
+            v = ys.float() * stride
             depth = hit_depth[ys, xs]
             pts_world = _backproject(view, u, v, depth)
 
