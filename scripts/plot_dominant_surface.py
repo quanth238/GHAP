@@ -43,6 +43,8 @@ def _select_view_indices(num_views: int, total_views: int) -> np.ndarray:
 def _maybe_stride(t: torch.Tensor, stride: int) -> torch.Tensor:
     if stride <= 1:
         return t
+    if t.dim() == 3:
+        return t[:, ::stride, ::stride]
     return t[::stride, ::stride]
 
 
@@ -238,6 +240,24 @@ def main() -> None:
     parser.add_argument("--max_samples", default=200000, type=int)
     parser.add_argument("--seed", default=42, type=int)
     parser.add_argument("--out_dir", default=None, type=str)
+    parser.add_argument("--topk", default=1, type=int)
+    parser.add_argument("--depth_gap_topk", default=0, type=int)
+    parser.add_argument("--depth_gap_rho", default=0.3, type=float)
+    parser.add_argument("--depth_gap_threshold", default=0.01, type=float)
+    parser.add_argument("--depth_gap_min_ratio", default=0.0, type=float)
+    parser.add_argument(
+        "--depth_gap_rho_thresholds",
+        default="",
+        type=str,
+        help="Comma-separated rho thresholds for depth-gap summaries (uses depth_gap_rho if empty).",
+    )
+    parser.add_argument(
+        "--depth_gap_xlim",
+        default=0.1,
+        type=float,
+        help="X-axis max for depth-gap CDF plot (<=0 disables clamping).",
+    )
+    parser.add_argument("--depth_gap_plot", action="store_true")
     parser.add_argument(
         "--rho_thresholds",
         default="0.3,0.5,0.7",
@@ -284,9 +304,14 @@ def main() -> None:
         rho_vals = []
         sum_w_vals = []
         maha_vals = []
+        depth_gap_vals = []
+        depth_gap_norm_vals = []
+        depth_gap_rho_vals = []
+        depth_gap_w_vals = []
 
         for idx in view_indices:
             view = views[int(idx)]
+            topk_contrib = max(int(args.topk), int(args.depth_gap_topk))
             pkg = render(
                 view,
                 gaussians,
@@ -296,6 +321,7 @@ def main() -> None:
                 separate_sh=False,
                 return_stats=True,
                 hit_quantile=args.hit_quantile,
+                topk_contrib=topk_contrib,
             )
 
             sum_w = pkg["opacity"]
@@ -313,7 +339,14 @@ def main() -> None:
             max_id = _maybe_stride(max_id, args.pixel_stride)
             hit_depth = _maybe_stride(hit_depth, args.pixel_stride)
 
-            valid = (sum_w > args.alpha_tau) & (max_w > 0) & (max_id >= 0) & (hit_depth > 0)
+            if max_id.dim() == 3:
+                max_id_top1 = max_id[0]
+                max_w_top1 = max_w[0]
+            else:
+                max_id_top1 = max_id
+                max_w_top1 = max_w
+
+            valid = (sum_w > args.alpha_tau) & (max_w_top1 > 0) & (max_id_top1 >= 0) & (hit_depth > 0)
             if not valid.any():
                 continue
 
@@ -334,7 +367,7 @@ def main() -> None:
             depth = hit_depth[ys, xs]
             pts_world = _backproject(view, u, v, depth)
 
-            ids = max_id[ys, xs].to(torch.int64)
+            ids = max_id_top1[ys, xs].to(torch.int64)
             dom_xyz = torch.from_numpy(teacher_xyz).to(device=pts_world.device, dtype=pts_world.dtype)[ids]
             d_dom = torch.linalg.norm(pts_world - dom_xyz, dim=1).detach().cpu().numpy()
 
@@ -343,7 +376,7 @@ def main() -> None:
             d_nn = d_nn.astype(np.float32)
 
             r = d_dom / (d_nn + 1e-8)
-            rho = (max_w[ys, xs] / (sum_w[ys, xs] + 1e-8)).detach().cpu().numpy()
+            rho = (max_w_top1[ys, xs] / (sum_w[ys, xs] + 1e-8)).detach().cpu().numpy()
             match = (idx_nn == ids.detach().cpu().numpy())
 
             dom_scale = teacher_scale[ids.detach().cpu().numpy()]
@@ -378,6 +411,33 @@ def main() -> None:
             rho_vals.append(rho.astype(np.float32))
             sum_w_vals.append(sum_w[ys, xs].detach().cpu().numpy().astype(np.float32))
 
+            if args.depth_gap_topk and max_id.dim() == 3 and max_id.shape[0] >= args.depth_gap_topk:
+                ids_topk = max_id[: args.depth_gap_topk, ys, xs].detach().cpu().numpy()
+                w_topk = max_w[: args.depth_gap_topk, ys, xs].detach().cpu().numpy()
+                valid_topk = ids_topk >= 0
+                if args.depth_gap_min_ratio > 0:
+                    w_top1 = np.maximum(w_topk[0], 1e-8)
+                    valid_topk &= w_topk >= (args.depth_gap_min_ratio * w_top1)
+                valid_count = valid_topk.sum(axis=0)
+                if np.any(valid_count >= 2):
+                    view_flat = _flatten_matrix(view.world_view_transform)
+                    cam_xyz = _transform_point4x3(teacher_xyz, view_flat)
+                    z_cam = cam_xyz[:, 2]
+                    ids_safe = np.clip(ids_topk, 0, z_cam.shape[0] - 1)
+                    z_vals = z_cam[ids_safe]
+                    z_vals[~valid_topk] = np.nan
+                    z_max = np.nanmax(z_vals, axis=0)
+                    z_min = np.nanmin(z_vals, axis=0)
+                    gap = z_max - z_min
+                    ids_top1_np = ids.detach().cpu().numpy()
+                    z_top1 = z_cam[np.clip(ids_top1_np, 0, z_cam.shape[0] - 1)]
+                    gap_norm = gap / (np.abs(z_top1) + 1e-6)
+                    keep = valid_count >= 2
+                    depth_gap_vals.append(gap[keep].astype(np.float32))
+                    depth_gap_norm_vals.append(gap_norm[keep].astype(np.float32))
+                    depth_gap_rho_vals.append(rho[keep].astype(np.float32))
+                    depth_gap_w_vals.append(sum_w[ys, xs].detach().cpu().numpy().astype(np.float32)[keep])
+
         if not dist_dom:
             print("[DomSurface] No valid samples found.")
             return
@@ -390,6 +450,16 @@ def main() -> None:
         rho_np = np.concatenate(rho_vals, axis=0)
         sum_w_np = np.concatenate(sum_w_vals, axis=0)
         maha_np = np.concatenate(maha_vals, axis=0)
+        depth_gap_np = np.concatenate(depth_gap_vals, axis=0) if depth_gap_vals else np.array([], dtype=np.float32)
+        depth_gap_norm_np = (
+            np.concatenate(depth_gap_norm_vals, axis=0) if depth_gap_norm_vals else np.array([], dtype=np.float32)
+        )
+        depth_gap_rho_np = (
+            np.concatenate(depth_gap_rho_vals, axis=0) if depth_gap_rho_vals else np.array([], dtype=np.float32)
+        )
+        depth_gap_w_np = (
+            np.concatenate(depth_gap_w_vals, axis=0) if depth_gap_w_vals else np.array([], dtype=np.float32)
+        )
 
         out_dir = args.out_dir or os.path.join(dataset.model_path, "dominant_surface")
         os.makedirs(out_dir, exist_ok=True)
@@ -404,6 +474,10 @@ def main() -> None:
             rho=rho_np,
             sum_w=sum_w_np,
             maha=maha_np,
+            depth_gap=depth_gap_np,
+            depth_gap_norm=depth_gap_norm_np,
+            depth_gap_rho=depth_gap_rho_np,
+            depth_gap_w=depth_gap_w_np,
         )
 
         print(f"[DomSurface] Saved stats to {out_dir}")
@@ -443,6 +517,41 @@ def main() -> None:
                 cover = float(sum_w_np[maha_np <= r_thr].sum()) / max(total_mass, 1e-8) * 100.0
                 print(f"[DomSurface] mass_cover(d_maha<= {r_thr:.2f}) = {cover:.2f}%")
 
+        if depth_gap_np.size > 0:
+            _summarize("depth_gap", depth_gap_np)
+            _summarize("depth_gap_norm", depth_gap_norm_np)
+            if args.depth_gap_rho_thresholds.strip():
+                rho_thresholds = [
+                    float(t) for t in args.depth_gap_rho_thresholds.split(",") if t.strip()
+                ]
+            else:
+                rho_thresholds = [float(args.depth_gap_rho)]
+            for tau in rho_thresholds:
+                low_mask = depth_gap_rho_np < tau
+                if not np.any(low_mask):
+                    print(f"[DomSurface] depth_gap_norm (rho<{tau:.2f}): empty")
+                    continue
+                low_gap_norm = depth_gap_norm_np[low_mask]
+                low_w = depth_gap_w_np[low_mask]
+                p50_low = float(np.percentile(low_gap_norm, 50))
+                p90_low = float(np.percentile(low_gap_norm, 90))
+                frac_low = float(np.mean(low_gap_norm <= args.depth_gap_threshold)) * 100.0
+                mass_low = float(low_w.sum()) / max(float(depth_gap_w_np.sum()), 1e-8) * 100.0
+                mass_low_ok = float(low_w[low_gap_norm <= args.depth_gap_threshold].sum()) / max(
+                    float(low_w.sum()), 1e-8
+                ) * 100.0
+                print(
+                    "[DomSurface] depth_gap_norm (rho<{:.2f}): p50={:.4f} p90={:.4f} frac<=thr={:.2f}% "
+                    "mass_cover={:.2f}% mass_ok={:.2f}%".format(
+                        tau,
+                        p50_low,
+                        p90_low,
+                        frac_low,
+                        mass_low,
+                        mass_low_ok,
+                    )
+                )
+
         if args.no_plot:
             return
 
@@ -469,6 +578,78 @@ def main() -> None:
         ax.set_ylabel("Density")
         fig.tight_layout()
         fig.savefig(os.path.join(out_dir, "dominant_surface_maha2d.png"), dpi=200)
+
+        if args.depth_gap_plot and depth_gap_norm_np.size > 0:
+            def _weighted_cdf(values: np.ndarray, weights: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+                order = np.argsort(values)
+                v = values[order]
+                w = np.maximum(weights[order], 0.0)
+                cdf = np.cumsum(w)
+                cdf = cdf / max(float(cdf[-1]), 1e-8)
+                cdf[-1] = 1.0
+                return v, cdf
+
+            def _cdf_at(v: np.ndarray, cdf: np.ndarray, thr: float) -> float:
+                if v.size == 0:
+                    return float("nan")
+                idx = int(np.searchsorted(v, thr, side="right")) - 1
+                if idx < 0:
+                    return 0.0
+                if idx >= cdf.size:
+                    return 1.0
+                return float(cdf[idx])
+
+            if args.depth_gap_rho_thresholds.strip():
+                rho_thresholds = [
+                    float(t) for t in args.depth_gap_rho_thresholds.split(",") if t.strip()
+                ]
+            else:
+                rho_thresholds = [float(args.depth_gap_rho)]
+
+            rho_cut = float(min(rho_thresholds)) if rho_thresholds else float(args.depth_gap_rho)
+            low_mask = depth_gap_rho_np < rho_cut
+            high_mask = ~low_mask
+
+            curves = []
+            if np.any(low_mask):
+                v_low, c_low = _weighted_cdf(depth_gap_norm_np[low_mask], depth_gap_w_np[low_mask])
+                curves.append((f"rho<{rho_cut:.2f}", v_low, c_low))
+            if np.any(high_mask):
+                v_high, c_high = _weighted_cdf(depth_gap_norm_np[high_mask], depth_gap_w_np[high_mask])
+                curves.append((f"rho≥{rho_cut:.2f}", v_high, c_high))
+
+            fig_gap, ax_main = plt.subplots(1, 1, figsize=(4.2, 3.0))
+            thr = float(args.depth_gap_threshold)
+
+            annot_offsets = [(6, 8), (6, -12)]
+            for idx, (name, v, cdf) in enumerate(curves):
+                line = ax_main.plot(v, cdf, label=name, linewidth=2.0)[0]
+                c_at = _cdf_at(v, cdf, thr) * 100.0
+                y_at = _cdf_at(v, cdf, thr)
+                dx, dy = annot_offsets[idx % len(annot_offsets)]
+                ax_main.annotate(
+                    f"CDF@{thr:.2f}={c_at:.1f}%",
+                    xy=(thr, y_at),
+                    xytext=(dx, dy),
+                    textcoords="offset points",
+                    fontsize=7,
+                    color=line.get_color(),
+                )
+
+            ax_main.set_xlabel("Normalized depth gap Δd / |z_1|")
+            ax_main.set_ylabel("Mass-weighted CDF")
+            if args.depth_gap_xlim > 0:
+                ax_main.set_xlim(0.0, float(args.depth_gap_xlim))
+            ax_main.set_ylim(0.0, 1.0)
+            ax_main.axvline(thr, color="k", linestyle="--", linewidth=1.0, alpha=0.6)
+            ax_main.text(thr, 0.98, f"δ={thr:.2f}", ha="center", va="top", fontsize=7)
+            ax_main.grid(True, alpha=0.2)
+            ax_main.legend(loc="lower right", frameon=False, fontsize=8)
+            ax_main.spines["top"].set_visible(False)
+            ax_main.spines["right"].set_visible(False)
+
+            fig_gap.tight_layout()
+            fig_gap.savefig(os.path.join(out_dir, "dominant_depth_gap_cdf.png"), dpi=300)
 
         print(f"[DomSurface] Plots written to {out_dir}")
 

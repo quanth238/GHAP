@@ -22,6 +22,14 @@ MAX_SAMPLES="${MAX_SAMPLES:-5000000}"
 SEED="${SEED:-42}"
 RHO_THRESHOLDS="${RHO_THRESHOLDS:-0.3,0.5,0.7}"
 MAHA_THRESHOLDS="${MAHA_THRESHOLDS:-1.0,2.0,3.0}"
+TOPK="${TOPK:-1}"
+DEPTH_GAP_TOPK="${DEPTH_GAP_TOPK:-0}"
+DEPTH_GAP_RHO="${DEPTH_GAP_RHO:-0.3}"
+DEPTH_GAP_THRESHOLD="${DEPTH_GAP_THRESHOLD:-0.01}"
+DEPTH_GAP_MIN_RATIO="${DEPTH_GAP_MIN_RATIO:-0.0}"
+DEPTH_GAP_RHO_THRESHOLDS="${DEPTH_GAP_RHO_THRESHOLDS:-0.3}"
+DEPTH_GAP_XLIM="${DEPTH_GAP_XLIM:-0.1}"
+DEPTH_GAP_PLOT="${DEPTH_GAP_PLOT:-no}"
 
 OUT_BASE="${OUT_BASE:-./results/mipnerf360/dominant_surface_${EXP_TITLE}}"
 
@@ -61,6 +69,11 @@ run_scene() {
   fi
 
   mkdir -p "$out_dir"
+  EXTRA_ARGS=()
+  if [[ "$DEPTH_GAP_PLOT" == "yes" ]]; then
+    EXTRA_ARGS+=(--depth_gap_plot)
+  fi
+
   CUDA_VISIBLE_DEVICES="${CUDA_DEVICE:-3}" python scripts/plot_dominant_surface.py \
     -s "$src" \
     -m "$model_path" \
@@ -74,7 +87,15 @@ run_scene() {
     --seed "$SEED" \
     --rho_thresholds "$RHO_THRESHOLDS" \
     --maha_thresholds "$MAHA_THRESHOLDS" \
-    --out_dir "$out_dir"
+    --topk "$TOPK" \
+    --depth_gap_topk "$DEPTH_GAP_TOPK" \
+    --depth_gap_rho "$DEPTH_GAP_RHO" \
+    --depth_gap_rho_thresholds "$DEPTH_GAP_RHO_THRESHOLDS" \
+    --depth_gap_threshold "$DEPTH_GAP_THRESHOLD" \
+    --depth_gap_min_ratio "$DEPTH_GAP_MIN_RATIO" \
+    --depth_gap_xlim "$DEPTH_GAP_XLIM" \
+    --out_dir "$out_dir" \
+    "${EXTRA_ARGS[@]}"
 }
 
 mkdir -p "$OUT_BASE"
@@ -110,6 +131,9 @@ match = []
 maha = []
 rho = []
 sum_w = []
+depth_gap_norm = []
+depth_gap_rho = []
+depth_gap_w = []
 for f in files:
     data = np.load(f)
     dist_dom.append(data["dist_dom"])
@@ -122,6 +146,10 @@ for f in files:
         rho.append(data["rho"])
     if "sum_w" in data:
         sum_w.append(data["sum_w"])
+    if "depth_gap_norm" in data and "depth_gap_rho" in data and "depth_gap_w" in data:
+        depth_gap_norm.append(data["depth_gap_norm"])
+        depth_gap_rho.append(data["depth_gap_rho"])
+        depth_gap_w.append(data["depth_gap_w"])
 
 dist_dom = np.concatenate(dist_dom, axis=0)
 dist_nn = np.concatenate(dist_nn, axis=0)
@@ -130,6 +158,9 @@ match = np.concatenate(match, axis=0)
 maha = np.concatenate(maha, axis=0) if maha else np.array([])
 rho = np.concatenate(rho, axis=0) if rho else np.array([])
 sum_w = np.concatenate(sum_w, axis=0) if sum_w else np.array([])
+depth_gap_norm = np.concatenate(depth_gap_norm, axis=0) if depth_gap_norm else np.array([])
+depth_gap_rho = np.concatenate(depth_gap_rho, axis=0) if depth_gap_rho else np.array([])
+depth_gap_w = np.concatenate(depth_gap_w, axis=0) if depth_gap_w else np.array([])
 
 def summarize(name, values):
     if values.size == 0:
@@ -206,6 +237,124 @@ if maha.size and sum_w.size:
         cover = float(sum_w[maha <= r_thr].sum()) / max(total_mass, 1e-8) * 100.0
         lines.append(f"mass_cover(d_maha<= {r_thr:.2f}) = {cover:.2f}%")
 
+gap_thr = float(os.environ.get("DEPTH_GAP_THRESHOLD", "0.05"))
+gap_rho_thr_raw = os.environ.get("DEPTH_GAP_RHO_THRESHOLDS", "")
+if not gap_rho_thr_raw:
+    gap_rho_thr_raw = os.environ.get("DEPTH_GAP_RHO", "0.3")
+gap_rho_thresholds = [float(t) for t in gap_rho_thr_raw.split(",") if t.strip()]
+
+def mass_cdf_at(values, weights, thr):
+    if values.size == 0 or weights.size == 0:
+        return float("nan")
+    w = np.maximum(weights, 0.0)
+    total = float(np.sum(w))
+    if total <= 0:
+        return float("nan")
+    return float(np.sum(w[values <= thr]) / total) * 100.0
+
+if depth_gap_norm.size and depth_gap_rho.size and depth_gap_w.size:
+    for tau in gap_rho_thresholds:
+        mask = depth_gap_rho < tau
+        if not np.any(mask):
+            lines.append(f"depth_gap_norm@{gap_thr:.2f} (rho<{tau:.2f}): empty")
+            continue
+        mass_ok = mass_cdf_at(depth_gap_norm[mask], depth_gap_w[mask], gap_thr)
+        lines.append(
+            f"depth_gap_norm@{gap_thr:.2f} (rho<{tau:.2f}): mass_ok={mass_ok:.2f}% (dataset-level)"
+        )
+
+    # Per-scene aggregate on CDF@threshold for low-ρ rays.
+    scene_vals = {tau: [] for tau in gap_rho_thresholds}
+    for f in files:
+        data = np.load(f)
+        if "depth_gap_norm" not in data or "depth_gap_rho" not in data or "depth_gap_w" not in data:
+            continue
+        g = data["depth_gap_norm"]
+        r = data["depth_gap_rho"]
+        w = data["depth_gap_w"]
+        for tau in gap_rho_thresholds:
+            mask = r < tau
+            if not np.any(mask):
+                continue
+            scene_vals[tau].append(mass_cdf_at(g[mask], w[mask], gap_thr))
+    for tau, vals in scene_vals.items():
+        if not vals:
+            continue
+        vals = np.array(vals, dtype=np.float32)
+        mean = float(np.mean(vals))
+        median = float(np.median(vals))
+        count80 = int(np.sum(vals >= 80.0))
+        lines.append(
+            f"depth_gap_norm@{gap_thr:.2f} (rho<{tau:.2f}): "
+            f"scene_mean={mean:.2f}% scene_median={median:.2f}% scenes>=80%={count80}/{len(vals)}"
+        )
+
+    # Dataset-level aggregate plot for depth-gap CDF (low-ρ vs others).
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        def weighted_cdf(values, weights):
+            order = np.argsort(values)
+            v = values[order]
+            w = np.maximum(weights[order], 0.0)
+            cdf = np.cumsum(w)
+            cdf = cdf / max(float(cdf[-1]), 1e-8)
+            cdf[-1] = 1.0
+            return v, cdf
+
+        def cdf_at(v, cdf, thr):
+            idx = int(np.searchsorted(v, thr, side="right")) - 1
+            if idx < 0:
+                return 0.0
+            if idx >= cdf.size:
+                return 1.0
+            return float(cdf[idx])
+
+        rho_cut = float(min(gap_rho_thresholds)) if gap_rho_thresholds else 0.3
+        low_mask = depth_gap_rho < rho_cut
+        high_mask = ~low_mask
+
+        curves = []
+        if np.any(low_mask):
+            v_low, c_low = weighted_cdf(depth_gap_norm[low_mask], depth_gap_w[low_mask])
+            curves.append((f"rho<{rho_cut:.2f}", v_low, c_low))
+        if np.any(high_mask):
+            v_high, c_high = weighted_cdf(depth_gap_norm[high_mask], depth_gap_w[high_mask])
+            curves.append((f"rho≥{rho_cut:.2f}", v_high, c_high))
+
+        xlim = float(os.environ.get("DEPTH_GAP_XLIM", "0.1"))
+        fig, ax = plt.subplots(1, 1, figsize=(4.2, 3.0))
+        for name, v, cdf in curves:
+            line = ax.plot(v, cdf, label=name, linewidth=2.0)[0]
+            c_at = cdf_at(v, cdf, gap_thr) * 100.0
+            y_at = cdf_at(v, cdf, gap_thr)
+            ax.annotate(
+                f"CDF@{gap_thr:.2f}={c_at:.1f}%",
+                xy=(gap_thr, y_at),
+                xytext=(6, 8),
+                textcoords="offset points",
+                fontsize=7,
+                color=line.get_color(),
+            )
+
+        ax.set_xlabel("Normalized depth gap Δd / |z_1|")
+        ax.set_ylabel("Mass-weighted CDF")
+        ax.set_xlim(0.0, xlim if xlim > 0 else 0.2)
+        ax.set_ylim(0.0, 1.0)
+        ax.axvline(gap_thr, color="k", linestyle="--", linewidth=1.0, alpha=0.6)
+        ax.text(gap_thr, 0.98, f"δ={gap_thr:.2f}", ha="center", va="top", fontsize=7)
+        ax.grid(True, alpha=0.2)
+        ax.legend(loc="lower right", frameon=False, fontsize=8)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        fig.tight_layout()
+        fig.savefig(os.path.join(out_base, "dominant_depth_gap_cdf_allscenes.png"), dpi=300)
+        lines.append(f"wrote_plot: {os.path.join(out_base, 'dominant_depth_gap_cdf_allscenes.png')}")
+    except Exception as exc:
+        lines.append(f"plot_error: {exc}")
+
 summary_path = os.path.join(out_base, "dominant_surface_summary.txt")
 with open(summary_path, "w", encoding="utf-8") as f:
     f.write("\n".join(lines) + "\n")
@@ -219,6 +368,9 @@ np.savez(
     maha=maha,
     rho=rho,
     sum_w=sum_w,
+    depth_gap_norm=depth_gap_norm,
+    depth_gap_rho=depth_gap_rho,
+    depth_gap_w=depth_gap_w,
 )
 print(f"[DomSurface] Wrote dataset summary to {summary_path}")
 PY
