@@ -103,6 +103,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
+    time_budget_sec = 0.0
+    if getattr(opt, "time_budget_minutes", 0.0) and opt.time_budget_minutes > 0:
+        time_budget_sec = float(opt.time_budget_minutes) * 60.0
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -329,6 +332,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                 _log_optimizer_state(gaussians.optimizer, "post_compaction")
                     else:
                         gaussians = subsampling(gaussians, compaction.ratio[index], 42, compaction.method)
+            if time_budget_sec > 0 and (time.time() - start_time) >= time_budget_sec:
+                if iteration not in saving_iterations:
+                    print("\n[TimeBudget] Saving Gaussians at iter {}".format(iteration))
+                    scene.save(iteration)
+                print(
+                    "[TimeBudget] Reached {:.2f} minutes at iter {}. Stopping.".format(
+                        time_budget_sec / 60.0, iteration
+                    )
+                )
+                progress_bar.close()
+                break
             # Optimizer step
             if iteration < opt.iterations:
                 if skip_step:
