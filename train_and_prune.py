@@ -27,6 +27,7 @@ from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from compaction.rss_voxel import RSSVoxelConfig, build_student_from_rss_voxel
+from compaction.greedy_coverage import GreedyCoverageConfig, build_student_from_greedy_coverage
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -330,6 +331,75 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             skip_step = True
                             if compaction.rss_debug:
                                 _log_optimizer_state(gaussians.optimizer, "post_compaction")
+                    elif compaction.method == "greedy_coverage":
+                        if torch.cuda.is_available():
+                            torch.cuda.reset_peak_memory_stats()
+                        pre_compact_count = int(gaussians.get_xyz.shape[0])
+                        if not getattr(compaction, "logged_counts", False):
+                            print(f"[GC] Gaussians pre-compaction: {pre_compact_count}")
+                        target_k = compaction.target_num_gaussians
+                        if target_k <= 0:
+                            ratio = compaction.ratio[index]
+                            target_k = int(ratio) if ratio > 1 else max(1, int(gaussians.get_xyz.shape[0] * ratio))
+                        target_k = min(target_k, gaussians.get_xyz.shape[0])
+                        print(f"[GC] Target K={target_k}")
+
+                        cfg = GreedyCoverageConfig(
+                            target_num_gaussians=target_k,
+                            num_views=compaction.gc_num_views,
+                            pixels_per_view=compaction.gc_pixels_per_view,
+                            alpha_tau=compaction.gc_alpha_tau,
+                            topk_contrib=compaction.gc_topk_contrib,
+                            seed=compaction.gc_seed,
+                            lazy=compaction.gc_lazy,
+                            debug=compaction.gc_debug,
+                            log_curve=compaction.gc_log_curve,
+                        )
+
+                        new_params, timings = build_student_from_greedy_coverage(
+                            gaussians, scene, dataset, pipe, cfg, SPARSE_ADAM_AVAILABLE
+                        )
+                        xyz_tensors = gaussians.replace_tensor_to_optimizer(new_params["xyz"], "xyz")
+                        gaussians._xyz = xyz_tensors["xyz"]
+                        f_dc_tensors = gaussians.replace_tensor_to_optimizer(new_params["f_dc"], "f_dc")
+                        gaussians._features_dc = f_dc_tensors["f_dc"]
+                        f_rest_tensors = gaussians.replace_tensor_to_optimizer(new_params["f_rest"], "f_rest")
+                        gaussians._features_rest = f_rest_tensors["f_rest"]
+                        opacity_tensors = gaussians.replace_tensor_to_optimizer(new_params["opacity"], "opacity")
+                        gaussians._opacity = opacity_tensors["opacity"]
+                        scaling_tensors = gaussians.replace_tensor_to_optimizer(new_params["scaling"], "scaling")
+                        gaussians._scaling = scaling_tensors["scaling"]
+                        rotation_tensors = gaussians.replace_tensor_to_optimizer(new_params["rotation"], "rotation")
+                        gaussians._rotation = rotation_tensors["rotation"]
+
+                        gaussians.xyz_gradient_accum = torch.zeros((gaussians.get_xyz.shape[0], 1), device="cuda")
+                        gaussians.denom = torch.zeros((gaussians.get_xyz.shape[0], 1), device="cuda")
+                        gaussians.max_radii2D = torch.zeros((gaussians.get_xyz.shape[0]), device="cuda")
+                        gaussians.optimizer.zero_grad(set_to_none=True)
+                        gaussians.exposure_optimizer.zero_grad(set_to_none=True)
+                        if torch.cuda.is_available():
+                            peak_mem = torch.cuda.max_memory_allocated()
+                            print(f"[GC] Peak CUDA memory: {peak_mem / (1024 ** 3):.2f} GB")
+                        print(
+                            "[GC] Timing: render+sample={:.2f}s greedy={:.2f}s total={:.2f}s "
+                            "rays={:.0f} pairs={:.0f} K={:.0f}".format(
+                                timings.get("render_sampling", 0.0),
+                                timings.get("greedy", 0.0),
+                                timings.get("total", 0.0),
+                                timings.get("num_rays", 0.0),
+                                timings.get("num_pairs", 0.0),
+                                timings.get("selected", 0.0),
+                            )
+                        )
+                        if "log_path" in timings:
+                            print(f"[GC] Curve saved: {timings['log_path']}")
+                        if not getattr(compaction, "logged_counts", False):
+                            post_compact_count = int(gaussians.get_xyz.shape[0])
+                            print(f"[GC] Gaussians post-compaction: {post_compact_count}")
+                            compaction.logged_counts = True
+                            compaction.did_compact = True
+                        compaction.finetune_start = time.time()
+                        skip_step = True
                     else:
                         gaussians = subsampling(gaussians, compaction.ratio[index], 42, compaction.method)
             if time_budget_sec > 0 and (time.time() - start_time) >= time_budget_sec:
@@ -534,7 +604,7 @@ if __name__ == "__main__":
     parser.add_argument('--random', action='store_true', default=False)
     parser.add_argument("--block_num", type=int, default=3000)
     parser.add_argument("--compaction_method", type=str, default="ghap",
-                        choices=["ghap", "rss_voxel", "render_surface_resample"])
+                        choices=["ghap", "rss_voxel", "render_surface_resample", "greedy_coverage"])
     parser.add_argument("--target_num_gaussians", type=int, default=0)
     parser.add_argument("--rss_num_views", type=int, default=300)
     parser.add_argument("--rss_pixels_per_view", type=int, default=100_000)
@@ -559,6 +629,16 @@ if __name__ == "__main__":
     parser.add_argument("--rss_no_voxel_search", action="store_true", default=False)
     parser.add_argument("--rss_no_depth_gate", action="store_true", default=False)
     parser.add_argument("--rss_seed", type=int, default=42)
+    parser.add_argument("--gc_num_views", type=int, default=200)
+    parser.add_argument("--gc_pixels_per_view", type=int, default=50000)
+    parser.add_argument("--gc_alpha_tau", type=float, default=0.02)
+    parser.add_argument("--gc_topk_contrib", type=int, default=4)
+    parser.add_argument("--gc_lazy", action="store_true", default=True)
+    parser.add_argument("--gc_no_lazy", action="store_false", dest="gc_lazy")
+    parser.add_argument("--gc_seed", type=int, default=42)
+    parser.add_argument("--gc_debug", action="store_true", default=False)
+    parser.add_argument("--gc_log_curve", action="store_true", default=True)
+    parser.add_argument("--gc_no_log_curve", action="store_false", dest="gc_log_curve")
     parser.add_argument("--iteration", type=int, default=None)
 
     args = parser.parse_args(sys.argv[1:])
@@ -604,6 +684,14 @@ if __name__ == "__main__":
             rss_no_voxel_search,
             rss_no_depth_gate,
             rss_seed,
+            gc_num_views,
+            gc_pixels_per_view,
+            gc_alpha_tau,
+            gc_topk_contrib,
+            gc_lazy,
+            gc_seed,
+            gc_debug,
+            gc_log_curve,
         ):
             self.flag = compact
             self.iter = sampling_iter
@@ -612,6 +700,8 @@ if __name__ == "__main__":
                 compaction_method = "rss_voxel"
             if compaction_method == "rss_voxel":
                 self.method = "rss_voxel"
+            elif compaction_method == "greedy_coverage":
+                self.method = "greedy_coverage"
             else:
                 self.method = "random" if random else "GMR"
             self.target_num_gaussians = target_num_gaussians
@@ -638,6 +728,14 @@ if __name__ == "__main__":
             self.rss_voxel_search = not rss_no_voxel_search
             self.rss_depth_gate = not rss_no_depth_gate
             self.rss_seed = rss_seed
+            self.gc_num_views = gc_num_views
+            self.gc_pixels_per_view = gc_pixels_per_view
+            self.gc_alpha_tau = gc_alpha_tau
+            self.gc_topk_contrib = gc_topk_contrib
+            self.gc_lazy = gc_lazy
+            self.gc_seed = gc_seed
+            self.gc_debug = gc_debug
+            self.gc_log_curve = gc_log_curve
             self.finetune_start = None
     # Start GUI server, configure and run training
     compaction = Compact(
@@ -670,6 +768,14 @@ if __name__ == "__main__":
         args.rss_no_voxel_search,
         args.rss_no_depth_gate,
         args.rss_seed,
+        args.gc_num_views,
+        args.gc_pixels_per_view,
+        args.gc_alpha_tau,
+        args.gc_topk_contrib,
+        args.gc_lazy,
+        args.gc_seed,
+        args.gc_debug,
+        args.gc_log_curve,
     )
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
