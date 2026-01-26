@@ -22,11 +22,19 @@ TANKS_ROOT="${TANKS_ROOT:-/home/tri-dev/dev/namn_workspace/dataset/tanks_and_tem
 DEEP_ROOT="${DEEP_ROOT:-/home/tri-dev/dev/namn_workspace/dataset/deep_blending}"
 MIP_ROOT="${MIP_ROOT:-/home/tri-dev/dev/namn_workspace/dataset/mipnerf360}"
 
-# Entries are: dataset:scene:images_dir (3 entries by default)
-QUAL_ENTRIES=(${QUAL_ENTRIES:-\
-"tanks_and_temples:truck:images" \
-"deep_blending:drjohnson:images" \
-"mipnerf360:room:images_2"})
+# Scene lists (defaults match run_all_datasets.sh)
+TANKS_SCENES=(train truck)
+DEEP_SCENES=(drjohnson playroom)
+MIP_OUTDOOR_SCENES=(bicycle flowers garden stump treehill)
+MIP_INDOOR_SCENES=(room counter kitchen bonsai)
+
+# Which datasets to include when auto-generating entries.
+# Override with QUAL_DATASETS="tanks_and_temples deep_blending" etc.
+QUAL_DATASETS=(${QUAL_DATASETS[@]:-tanks_and_temples deep_blending mipnerf360})
+
+# Entries are: dataset:scene:images_dir
+# If QUAL_ENTRIES is set, it is used as-is. Otherwise it is auto-generated.
+QUAL_ENTRIES=(${QUAL_ENTRIES[@]:-})
 
 # Render split: "test" or "train"
 RENDER_SPLIT="${RENDER_SPLIT:-test}"
@@ -227,6 +235,34 @@ run_entry() {
 
   echo "[Qual] Saved qualitative renders to ${qual_root}"
 }
+
+if [[ "${#QUAL_ENTRIES[@]}" -eq 0 ]]; then
+  for dataset in "${QUAL_DATASETS[@]}"; do
+    case "$dataset" in
+      tanks_and_temples)
+        for scene in "${TANKS_SCENES[@]}"; do
+          QUAL_ENTRIES+=("tanks_and_temples:${scene}:images")
+        done
+        ;;
+      deep_blending)
+        for scene in "${DEEP_SCENES[@]}"; do
+          QUAL_ENTRIES+=("deep_blending:${scene}:images")
+        done
+        ;;
+      mipnerf360)
+        for scene in "${MIP_OUTDOOR_SCENES[@]}"; do
+          QUAL_ENTRIES+=("mipnerf360:${scene}:images_4")
+        done
+        for scene in "${MIP_INDOOR_SCENES[@]}"; do
+          QUAL_ENTRIES+=("mipnerf360:${scene}:images_2")
+        done
+        ;;
+      *)
+        echo "[Qual] Unknown dataset in QUAL_DATASETS: ${dataset}"
+        ;;
+    esac
+  done
+fi
 
 for entry in "${QUAL_ENTRIES[@]}"; do
   run_entry "$entry"
