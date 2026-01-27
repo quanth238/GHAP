@@ -544,7 +544,7 @@ if __name__ == "__main__":
     parser.add_argument("--rss_depth_var_thresh", type=float, default=0.01)
     parser.add_argument("--rss_center_mode", type=str, default="mean", choices=["mean", "representative", "teacher"])
     parser.add_argument("--rss_teacher_selector", type=str, default="voxel", choices=["voxel", "octree", "topk"])
-    parser.add_argument("--rss_mass_source", type=str, default="dominant", choices=["dominant", "opacity"])
+    parser.add_argument("--rss_mass_source", type=str, default="dominant", choices=["dominant", "opacity", "psc"])
     parser.add_argument("--rss_mass_topk", type=int, default=1)
     parser.add_argument("--rss_no_reset", action="store_true", default=False)
     parser.add_argument("--rss_debug", action="store_true", default=False)

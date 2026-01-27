@@ -758,6 +758,93 @@ def build_student_from_rss_voxel(
             timings["render_sampling"] = render_time
             timings["num_samples_raw"] = float(num_valid)
             timings["num_samples"] = float(num_valid)
+        elif cfg.mass_source == "psc":
+            # Probabilistic coverage (noisy-OR) style one-pass mass.
+            render_time = 0.0
+            num_valid = 0
+            device = gaussians.get_xyz.device
+            mass_t = torch.zeros((teacher_xyz.shape[0],), dtype=torch.float32, device=device)
+
+            for idx in view_indices:
+                view = cams[int(idx)]
+                t0 = time.time()
+                render_pkg = _render_stats(
+                    view,
+                    gaussians,
+                    pipe,
+                    separate_sh,
+                    cfg.hit_quantile,
+                    topk_contrib=max(1, cfg.mass_topk),
+                )
+                render_time += time.time() - t0
+
+                sum_w = render_pkg["opacity"]
+                max_id = render_pkg["max_id"]
+                max_w = render_pkg["max_w"]
+
+                if view.alpha_mask is not None:
+                    mask = view.alpha_mask[0].to(sum_w.device)
+                    sum_w = sum_w * mask
+                    max_w = max_w * mask
+
+                valid_px = sum_w > cfg.alpha_tau
+                num_valid += int(valid_px.sum().item())
+                if not valid_px.any():
+                    continue
+
+                if max_id.dim() == 2:
+                    max_id = max_id.unsqueeze(0)
+                    max_w = max_w.unsqueeze(0)
+
+                k = max_id.shape[0]
+                flat_valid = valid_px.reshape(-1)
+                valid_idx = flat_valid.nonzero(as_tuple=False).squeeze(1)
+                if valid_idx.numel() == 0:
+                    continue
+
+                sum_w_flat = sum_w.reshape(-1)[valid_idx]
+                if sum_w_flat.numel() == 0:
+                    continue
+
+                max_id_flat = max_id.reshape(k, -1)[:, valid_idx]
+                max_w_raw = max_w.reshape(k, -1)[:, valid_idx]
+
+                tex_scale = None
+                if cfg.lambda_tex > 0:
+                    tex_grad = _compute_texture_grad(view.original_image.to(sum_w.device))
+                    if view.alpha_mask is not None:
+                        tex_grad = tex_grad * mask
+                    tex_scale = 1.0 + cfg.lambda_tex * tex_grad
+                    tex_scale = tex_scale.reshape(-1)[valid_idx]
+
+                if tex_scale is not None:
+                    max_w_scaled = max_w_raw * tex_scale.unsqueeze(0)
+                else:
+                    max_w_scaled = max_w_raw
+
+                denom = sum_w_flat.unsqueeze(0) + 1e-8
+                p = max_w_raw / denom
+                q = torch.ones_like(sum_w_flat)
+
+                for kk in range(k):
+                    w_k = max_w_scaled[kk]
+                    p_k = p[kk]
+                    delta = w_k * q
+                    q = q * (1.0 - p_k)
+                    ids = max_id_flat[kk].to(torch.int64)
+                    keep = torch.logical_and(ids >= 0, delta > 0)
+                    if keep.any():
+                        counts = torch.bincount(
+                            ids[keep],
+                            weights=delta[keep],
+                            minlength=teacher_xyz.shape[0],
+                        )
+                        mass_t += counts
+
+            mass = mass_t.detach().cpu().numpy().astype(np.float32)
+            timings["render_sampling"] = render_time
+            timings["num_samples_raw"] = float(num_valid)
+            timings["num_samples"] = float(num_valid)
         else:
             raise ValueError(f"Unknown rss_mass_source: {cfg.mass_source}")
 
