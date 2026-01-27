@@ -338,6 +338,7 @@ def main():
     parser.add_argument("--log-y", action="store_true")
     parser.add_argument("--hexbin-gridsize", type=int, default=120)
     parser.add_argument("--hexbin-mincnt", type=int, default=1)
+    parser.add_argument("--hexbin-log", action="store_true", default=False, help="Use log-binned hexbin counts.")
     parser.add_argument("--cmap", default="magma")
     parser.add_argument("--local-normalize", action="store_true", default=True, help="Normalize color per scene.")
     parser.add_argument("--global-normalize", action="store_false", dest="local_normalize")
@@ -356,13 +357,13 @@ def main():
     parser.add_argument("--hidden-giants-box", default="0.8,1.0,2e-2,0.8")
     parser.add_argument("--hidden-giants-text", default="Hidden Giants (α>0.8, m<1)")
     parser.add_argument("--annotate-transparent-details", action="store_true", default=False)
-    parser.add_argument("--transparent-details-box", default="0.0,0.35,1e2,3e3")
+    parser.add_argument("--transparent-details-box", default="0.0,0.2,1e2,3e3")
     parser.add_argument("--transparent-details-text", default="Transparent details (α<0.2, m>10²)")
     parser.add_argument("--transparent-details-auto-y", action="store_true", default=True)
     parser.add_argument("--transparent-details-fixed-y", action="store_false", dest="transparent_details_auto_y")
     parser.add_argument("--transparent-details-qmin", type=float, default=0.75)
     parser.add_argument("--transparent-details-qmax", type=float, default=0.95)
-    parser.add_argument("--transparent-details-xrange", default="0.0,0.35")
+    parser.add_argument("--transparent-details-xrange", default="0.0,0.2")
     parser.add_argument("--transparent-details-log-quantiles", action="store_true", default=True)
     parser.add_argument("--transparent-details-linear-quantiles", action="store_false", dest="transparent_details_log_quantiles")
     parser.add_argument("--anno-color", default="#1f77b4")
@@ -510,6 +511,7 @@ def main():
             opacity,
             mass_plot,
             gridsize=args.hexbin_gridsize,
+            bins="log" if args.hexbin_log else None,
             cmap=args.cmap,
             mincnt=args.hexbin_mincnt,
             xscale="linear",
@@ -588,15 +590,27 @@ def main():
             ax.add_patch(rect)
 
         if args.annotate_transparent_details:
+            box_in_normalized = False
             if args.transparent_details_auto_y:
-                auto_box = _compute_transparent_details_box(opacity, mass_np, args)
+                if args.y_normalize:
+                    x0, x1 = [float(v) for v in args.transparent_details_xrange.split(",")]
+                    mask = (opacity >= x0) & (opacity <= x1) & (mass_plot > 0)
+                    if mask.sum() < 10:
+                        auto_box = None
+                    else:
+                        y0 = np.quantile(mass_plot[mask], args.transparent_details_qmin)
+                        y1 = np.quantile(mass_plot[mask], args.transparent_details_qmax)
+                        auto_box = (x0, x1, float(y0), float(y1))
+                        box_in_normalized = True
+                else:
+                    auto_box = _compute_transparent_details_box(opacity, mass_np, args)
                 if auto_box is None:
                     x0, x1, y0, y1 = [float(v) for v in args.transparent_details_box.split(",")]
                 else:
                     x0, x1, y0, y1 = auto_box
             else:
                 x0, x1, y0, y1 = [float(v) for v in args.transparent_details_box.split(",")]
-            if args.y_normalize:
+            if args.y_normalize and not box_in_normalized:
                 vmin, vmax = global_norm if global_norm is not None else norm_range
                 if vmin is not None and vmax is not None:
                     y0 = _normalize_values(np.array([y0]), args.y_norm_mode, vmin, vmax)[0]

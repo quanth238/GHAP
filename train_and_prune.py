@@ -255,6 +255,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             seed=compaction.rss_seed,
                             debug=compaction.rss_debug,
                             debug_samples=compaction.rss_debug_samples,
+                            log_alpha_tau=compaction.rss_log_alpha_tau,
+                            log_alpha_tau_samples=compaction.rss_log_alpha_tau_samples,
                             snap_to_teacher=compaction.rss_snap_to_teacher,
                             snap_factor=compaction.rss_snap_factor,
                             snap_min=compaction.rss_snap_min,
@@ -549,6 +551,8 @@ if __name__ == "__main__":
     parser.add_argument("--rss_no_reset", action="store_true", default=False)
     parser.add_argument("--rss_debug", action="store_true", default=False)
     parser.add_argument("--rss_debug_samples", type=int, default=10000)
+    parser.add_argument("--rss_log_alpha_tau", action="store_true", default=False)
+    parser.add_argument("--rss_log_alpha_tau_samples", type=int, default=200000)
     parser.add_argument("--rss_snap_to_teacher", action="store_true", default=False)
     parser.add_argument("--rss_snap_factor", type=float, default=5.0)
     parser.add_argument("--rss_snap_min", type=float, default=0.0)
@@ -594,6 +598,8 @@ if __name__ == "__main__":
             rss_no_reset,
             rss_debug,
             rss_debug_samples,
+            rss_log_alpha_tau,
+            rss_log_alpha_tau_samples,
             rss_snap_to_teacher,
             rss_snap_factor,
             rss_snap_min,
@@ -628,6 +634,8 @@ if __name__ == "__main__":
             self.rss_no_reset = rss_no_reset
             self.rss_debug = rss_debug
             self.rss_debug_samples = rss_debug_samples
+            self.rss_log_alpha_tau = rss_log_alpha_tau
+            self.rss_log_alpha_tau_samples = rss_log_alpha_tau_samples
             self.rss_snap_to_teacher = rss_snap_to_teacher
             self.rss_snap_factor = rss_snap_factor
             self.rss_snap_min = rss_snap_min
@@ -660,6 +668,8 @@ if __name__ == "__main__":
         args.rss_no_reset,
         args.rss_debug,
         args.rss_debug_samples,
+        args.rss_log_alpha_tau,
+        args.rss_log_alpha_tau_samples,
         args.rss_snap_to_teacher,
         args.rss_snap_factor,
         args.rss_snap_min,

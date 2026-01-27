@@ -14,6 +14,11 @@ COMPACTION_METHOD="${COMPACTION_METHOD:-rss_voxel}" # ghap or rss_voxel
 ALPHA_TAUS=(${ALPHA_TAUS[@]:-0.0 0.01 0.02 0.05 0.1})
 SAMPLING_RATIO="${SAMPLING_RATIO:-0.1}"
 TARGET_NUM_GAUSSIANS="${TARGET_NUM_GAUSSIANS:-}" # override ratio if set
+RSS_MASS_SOURCE="${RSS_MASS_SOURCE:-psc}"
+RSS_MASS_TOPK="${RSS_MASS_TOPK:-4}"
+RSS_LOG_ALPHA_TAU="${RSS_LOG_ALPHA_TAU:-yes}"
+RSS_LOG_ALPHA_TAU_SAMPLES="${RSS_LOG_ALPHA_TAU_SAMPLES:-200000}"
+RSS_NUM_VIEWS="${RSS_NUM_VIEWS:-9999}"
 
 TWO_PHASE="${TWO_PHASE:-no}"
 PHASE2_ITER="${PHASE2_ITER:-30000}"
@@ -196,11 +201,19 @@ run_scene() {
     --rss_seed "$run_seed"
     --rss_center_mode teacher
     --rss_teacher_selector octree
-    --rss_num_views 9999
+    --rss_num_views "$RSS_NUM_VIEWS"
     --rss_alpha_tau "$alpha_tau"
     --rss_hit_quantile 0.3
     --rss_lambda_tex 0.5
+    --rss_mass_source "$RSS_MASS_SOURCE"
+    --rss_mass_topk "$RSS_MASS_TOPK"
   )
+  if [[ "$RSS_LOG_ALPHA_TAU" == "yes" ]]; then
+    run_compact_args+=(
+      --rss_log_alpha_tau
+      --rss_log_alpha_tau_samples "$RSS_LOG_ALPHA_TAU_SAMPLES"
+    )
+  fi
   if [[ -n "$TARGET_NUM_GAUSSIANS" ]]; then
     run_compact_args+=(--target_num_gaussians "$TARGET_NUM_GAUSSIANS")
   fi

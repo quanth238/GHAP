@@ -48,6 +48,8 @@ class RSSVoxelConfig:
     snap_min: float = 0.0
     snap_unique: bool = False
     snap_fill_teacher: bool = True
+    log_alpha_tau: bool = False
+    log_alpha_tau_samples: int = 200000
 
 
 def _select_view_indices(num_views: int, total_views: int) -> np.ndarray:
@@ -284,6 +286,24 @@ def _debug_reprojection(view, debug_np: Dict[str, np.ndarray]) -> None:
                 float(np.max(std_ratio)),
             )
         )
+
+
+def _alpha_tau_log_summary(samples: np.ndarray, alpha_tau: float, valid_ratio: float) -> None:
+    if samples.size == 0:
+        print("[RSS][AlphaTau] No samples collected.")
+        return
+    pct = [1, 5, 10, 25, 50, 75, 90, 95, 99]
+    vals = np.percentile(samples, pct).astype(np.float32)
+    stats = " ".join([f"p{p:02d}={v:.4f}" for p, v in zip(pct, vals)])
+    print(
+        "[RSS][AlphaTau] sum_w stats: mean={:.4f} max={:.4f} {} | tau={:.4f} keep={:.2f}%".format(
+            float(samples.mean()),
+            float(samples.max()),
+            stats,
+            float(alpha_tau),
+            100.0 * float(valid_ratio),
+        )
+    )
 
 
 def _filter_points(
@@ -679,6 +699,12 @@ def build_student_from_rss_voxel(
 
     cams = scene.getTrainCameras().copy()
     view_indices = _select_view_indices(cfg.num_views, len(cams))
+    alpha_samples = []
+    alpha_total = 0
+    alpha_valid = 0
+    per_view_alpha = 0
+    if cfg.log_alpha_tau and cfg.log_alpha_tau_samples > 0:
+        per_view_alpha = max(1, int(cfg.log_alpha_tau_samples // max(1, len(view_indices))))
 
     use_teacher_resample = cfg.center_mode == "teacher"
     teacher_xyz = None
@@ -722,6 +748,20 @@ def build_student_from_rss_voxel(
 
                 valid_px = sum_w > cfg.alpha_tau
                 num_valid += int(valid_px.sum().item())
+                if cfg.log_alpha_tau and per_view_alpha > 0:
+                    alpha_valid += int(valid_px.sum().item())
+                    if view.alpha_mask is not None:
+                        alpha_total += int(mask.sum().item())
+                        flat = sum_w[mask > 0].reshape(-1)
+                    else:
+                        alpha_total += int(sum_w.numel())
+                        flat = sum_w.reshape(-1)
+                    if flat.numel() > 0:
+                        take = min(per_view_alpha, int(flat.numel()))
+                        if flat.numel() > take:
+                            idx = torch.randint(0, flat.numel(), (take,), device=flat.device)
+                            flat = flat[idx]
+                        alpha_samples.append(flat.detach().cpu().numpy())
 
                 if valid_px.any():
                     tex_scale = None
@@ -758,8 +798,114 @@ def build_student_from_rss_voxel(
             timings["render_sampling"] = render_time
             timings["num_samples_raw"] = float(num_valid)
             timings["num_samples"] = float(num_valid)
+        elif cfg.mass_source == "psc":
+            # Probabilistic coverage (noisy-OR) style one-pass mass.
+            render_time = 0.0
+            num_valid = 0
+            device = gaussians.get_xyz.device
+            mass_t = torch.zeros((teacher_xyz.shape[0],), dtype=torch.float32, device=device)
+
+            for idx in view_indices:
+                view = cams[int(idx)]
+                t0 = time.time()
+                render_pkg = _render_stats(
+                    view,
+                    gaussians,
+                    pipe,
+                    separate_sh,
+                    cfg.hit_quantile,
+                    topk_contrib=max(1, cfg.mass_topk),
+                )
+                render_time += time.time() - t0
+
+                sum_w = render_pkg["opacity"]
+                max_id = render_pkg["max_id"]
+                max_w = render_pkg["max_w"]
+
+                if view.alpha_mask is not None:
+                    mask = view.alpha_mask[0].to(sum_w.device)
+                    sum_w = sum_w * mask
+                    max_w = max_w * mask
+
+                valid_px = sum_w > cfg.alpha_tau
+                num_valid += int(valid_px.sum().item())
+                if cfg.log_alpha_tau and per_view_alpha > 0:
+                    alpha_valid += int(valid_px.sum().item())
+                    if view.alpha_mask is not None:
+                        alpha_total += int(mask.sum().item())
+                        flat = sum_w[mask > 0].reshape(-1)
+                    else:
+                        alpha_total += int(sum_w.numel())
+                        flat = sum_w.reshape(-1)
+                    if flat.numel() > 0:
+                        take = min(per_view_alpha, int(flat.numel()))
+                        if flat.numel() > take:
+                            idx = torch.randint(0, flat.numel(), (take,), device=flat.device)
+                            flat = flat[idx]
+                        alpha_samples.append(flat.detach().cpu().numpy())
+                if not valid_px.any():
+                    continue
+
+                if max_id.dim() == 2:
+                    max_id = max_id.unsqueeze(0)
+                    max_w = max_w.unsqueeze(0)
+
+                k = max_id.shape[0]
+                flat_valid = valid_px.reshape(-1)
+                valid_idx = flat_valid.nonzero(as_tuple=False).squeeze(1)
+                if valid_idx.numel() == 0:
+                    continue
+
+                sum_w_flat = sum_w.reshape(-1)[valid_idx]
+                if sum_w_flat.numel() == 0:
+                    continue
+
+                max_id_flat = max_id.reshape(k, -1)[:, valid_idx]
+                max_w_raw = max_w.reshape(k, -1)[:, valid_idx]
+
+                tex_scale = None
+                if cfg.lambda_tex > 0:
+                    tex_grad = _compute_texture_grad(view.original_image.to(sum_w.device))
+                    if view.alpha_mask is not None:
+                        tex_grad = tex_grad * mask
+                    tex_scale = 1.0 + cfg.lambda_tex * tex_grad
+                    tex_scale = tex_scale.reshape(-1)[valid_idx]
+
+                if tex_scale is not None:
+                    max_w_scaled = max_w_raw * tex_scale.unsqueeze(0)
+                else:
+                    max_w_scaled = max_w_raw
+
+                denom = sum_w_flat.unsqueeze(0) + 1e-8
+                p = max_w_raw / denom
+                q = torch.ones_like(sum_w_flat)
+
+                for kk in range(k):
+                    w_k = max_w_scaled[kk]
+                    p_k = p[kk]
+                    delta = w_k * q
+                    q = q * (1.0 - p_k)
+                    ids = max_id_flat[kk].to(torch.int64)
+                    keep = torch.logical_and(ids >= 0, delta > 0)
+                    if keep.any():
+                        counts = torch.bincount(
+                            ids[keep],
+                            weights=delta[keep],
+                            minlength=teacher_xyz.shape[0],
+                        )
+                        mass_t += counts
+
+            mass = mass_t.detach().cpu().numpy().astype(np.float32)
+            timings["render_sampling"] = render_time
+            timings["num_samples_raw"] = float(num_valid)
+            timings["num_samples"] = float(num_valid)
         else:
             raise ValueError(f"Unknown rss_mass_source: {cfg.mass_source}")
+
+        if cfg.log_alpha_tau and alpha_samples:
+            samples = np.concatenate(alpha_samples, axis=0)
+            valid_ratio = (alpha_valid / max(alpha_total, 1)) if alpha_total > 0 else 0.0
+            _alpha_tau_log_summary(samples, cfg.alpha_tau, valid_ratio)
 
         if mass.sum() <= 0:
             raise RuntimeError("Teacher-space resampling collected 0 mass across views.")
@@ -819,7 +965,26 @@ def build_student_from_rss_voxel(
             depth_var = render_pkg["depth_var"]
 
             if view.alpha_mask is not None:
-                alpha = alpha * view.alpha_mask[0].to(alpha.device)
+                mask = view.alpha_mask[0].to(alpha.device)
+                alpha = alpha * mask
+            else:
+                mask = None
+
+            if cfg.log_alpha_tau and per_view_alpha > 0:
+                valid_px = alpha > cfg.alpha_tau
+                alpha_valid += int(valid_px.sum().item())
+                if mask is not None:
+                    alpha_total += int(mask.sum().item())
+                    flat = alpha[mask > 0].reshape(-1)
+                else:
+                    alpha_total += int(alpha.numel())
+                    flat = alpha.reshape(-1)
+                if flat.numel() > 0:
+                    take = min(per_view_alpha, int(flat.numel()))
+                    if flat.numel() > take:
+                        idx = torch.randint(0, flat.numel(), (take,), device=flat.device)
+                        flat = flat[idx]
+                    alpha_samples.append(flat.detach().cpu().numpy())
 
             tex_grad = None
             if cfg.lambda_tex > 0:
@@ -844,6 +1009,10 @@ def build_student_from_rss_voxel(
                 timings["debug_done"] = 1.0
 
         timings["render_sampling"] = render_time + sample_time
+        if cfg.log_alpha_tau and alpha_samples:
+            samples = np.concatenate(alpha_samples, axis=0)
+            valid_ratio = (alpha_valid / max(alpha_total, 1)) if alpha_total > 0 else 0.0
+            _alpha_tau_log_summary(samples, cfg.alpha_tau, valid_ratio)
 
         if not points_list:
             raise RuntimeError("RSS sampling collected 0 points across views.")
