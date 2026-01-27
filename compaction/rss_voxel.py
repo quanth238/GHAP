@@ -41,21 +41,17 @@ class RSSVoxelConfig:
     bbox_percentiles: Tuple[float, float] = (1.0, 99.0)
     min_centers_frac: float = 0.7
     min_centers_abs: int = 20000
-    debug: bool = False
-    debug_samples: int = 10000
     snap_to_teacher: bool = False
     snap_factor: float = 5.0
     snap_min: float = 0.0
     snap_unique: bool = False
     snap_fill_teacher: bool = True
-    log_alpha_tau: bool = False
-    log_alpha_tau_samples: int = 200000
 
 
 def _select_view_indices(num_views: int, total_views: int) -> np.ndarray:
     if total_views <= 0:
         return np.array([], dtype=np.int64)
-    if num_views >= total_views:
+    if num_views <= 0 or num_views >= total_views:
         return np.arange(total_views, dtype=np.int64)
     return np.linspace(0, total_views - 1, num_views, dtype=np.int64)
 
@@ -148,8 +144,38 @@ def _sample_surface_points(
     max_attempts = 8
     points_world = []
     weights = []
-    debug_info: Dict[str, np.ndarray] = {}
-    debug_limit = cfg.debug_samples if cfg.debug else 0
+    if cfg.pixels_per_view <= 0:
+        idx = torch.arange(total_pixels, device=device)
+        a = alpha_flat
+        d = depth_flat
+        valid = a > cfg.alpha_tau
+        valid = torch.logical_and(valid, d > 0)
+        if cfg.depth_gate:
+            valid = torch.logical_and(valid, d > view.znear)
+            valid = torch.logical_and(valid, d < view.zfar)
+        if var_flat is not None and cfg.depth_var_thresh > 0:
+            valid = torch.logical_and(valid, var_flat < cfg.depth_var_thresh)
+
+        if tex_flat is not None and cfg.lambda_tex > 0:
+            wts = a * (1.0 + cfg.lambda_tex * tex_flat)
+        else:
+            wts = a
+
+        if not valid.any():
+            return np.zeros((0, 3), dtype=np.float32), np.zeros((0,), dtype=np.float32), {}
+
+        valid_idx = idx[valid]
+        depth = d[valid]
+        wts = wts[valid]
+        u = (valid_idx % w).float()
+        v = (valid_idx // w).float()
+        pts = _backproject(view, u, v, depth)
+
+        return (
+            pts.detach().cpu().numpy().astype(np.float32),
+            wts.detach().cpu().numpy().astype(np.float32),
+            {},
+        )
 
     needed = cfg.pixels_per_view
     for _ in range(max_attempts):
@@ -185,124 +211,15 @@ def _sample_surface_points(
             weights.append(wts)
             needed -= keep
 
-            if debug_limit > 0:
-                dbg_keep = min(debug_limit, keep)
-                dbg_idx = valid_idx[:dbg_keep]
-                debug_info.setdefault("u", []).append((dbg_idx % w).float())
-                debug_info.setdefault("v", []).append((dbg_idx // w).float())
-                debug_info.setdefault("depth", []).append(depth[:dbg_keep])
-                if var_flat is not None:
-                    debug_info.setdefault("var", []).append(var_flat[dbg_idx].float())
-                debug_limit -= dbg_keep
-
     if not points_world:
         return np.zeros((0, 3), dtype=np.float32), np.zeros((0,), dtype=np.float32), {}
 
     pts = torch.cat(points_world, dim=0)
     wts = torch.cat(weights, dim=0)
-    debug_np: Dict[str, np.ndarray] = {}
-    if debug_info:
-        debug_np["u"] = torch.cat(debug_info["u"], dim=0).detach().cpu().numpy()
-        debug_np["v"] = torch.cat(debug_info["v"], dim=0).detach().cpu().numpy()
-        debug_np["depth"] = torch.cat(debug_info["depth"], dim=0).detach().cpu().numpy()
-        if "var" in debug_info:
-            debug_np["var"] = torch.cat(debug_info["var"], dim=0).detach().cpu().numpy()
     return (
         pts.detach().cpu().numpy().astype(np.float32),
         wts.detach().cpu().numpy().astype(np.float32),
-        debug_np,
-    )
-
-
-def _debug_reprojection(view, debug_np: Dict[str, np.ndarray]) -> None:
-    if not debug_np:
-        print("[RSS][Debug] No debug samples available.")
-        return
-    u = torch.from_numpy(debug_np["u"]).float().cuda()
-    v = torch.from_numpy(debug_np["v"]).float().cuda()
-    depth = torch.from_numpy(debug_np["depth"]).float().cuda()
-    pts_world = _backproject(view, u, v, depth)
-
-    # Use row-major W2C for reprojection.
-    world_to_view = view.world_view_transform.transpose(0, 1)
-    pts_view = geom_transform_points(pts_world, world_to_view)
-    z = pts_view[:, 2]
-    fx = fov2focal(view.FoVx, view.image_width)
-    fy = fov2focal(view.FoVy, view.image_height)
-    cx = (view.image_width - 1) * 0.5
-    cy = (view.image_height - 1) * 0.5
-    eps = 1e-6
-    u_proj = fx * (pts_view[:, 0] / (z + eps)) + cx
-    v_proj = fy * (pts_view[:, 1] / (z + eps)) + cy
-    reproj_err = torch.sqrt((u_proj - u) ** 2 + (v_proj - v) ** 2)
-
-    err = reproj_err.detach().cpu().numpy()
-    z_cpu = z.detach().cpu().numpy()
-    depth_cpu = depth.detach().cpu().numpy()
-    ratio = z_cpu / (depth_cpu + 1e-6)
-
-    print(
-        "[RSS][Debug] Reproj err px: mean={:.3f} med={:.3f} p95={:.3f} max={:.3f}".format(
-            float(np.mean(err)),
-            float(np.median(err)),
-            float(np.percentile(err, 95)),
-            float(np.max(err)),
-        )
-    )
-    print(
-        "[RSS][Debug] Depth sign: z<=0 {:.2f}% depth<=0 {:.2f}%".format(
-            100.0 * float(np.mean(z_cpu <= 0)),
-            100.0 * float(np.mean(depth_cpu <= 0)),
-        )
-    )
-    print(
-        "[RSS][Debug] z/depth ratio: med={:.4f} p05={:.4f} p95={:.4f}".format(
-            float(np.median(ratio)),
-            float(np.percentile(ratio, 5)),
-            float(np.percentile(ratio, 95)),
-        )
-    )
-    print(
-        "[RSS][Debug] depth_hit stats: min={:.4f} med={:.4f} max={:.4f}".format(
-            float(np.min(depth_cpu)),
-            float(np.median(depth_cpu)),
-            float(np.max(depth_cpu)),
-        )
-    )
-    if "var" in debug_np:
-        var = np.maximum(debug_np["var"], 0.0)
-        std_ratio = np.sqrt(var) / (np.abs(depth_cpu) + 1e-6)
-        print(
-            "[RSS][Debug] depth_var stats: min={:.6f} med={:.6f} max={:.6f}".format(
-                float(np.min(var)),
-                float(np.median(var)),
-                float(np.max(var)),
-            )
-        )
-        print(
-            "[RSS][Debug] sqrt(var)/|depth|: med={:.4f} p95={:.4f} max={:.4f}".format(
-                float(np.median(std_ratio)),
-                float(np.percentile(std_ratio, 95)),
-                float(np.max(std_ratio)),
-            )
-        )
-
-
-def _alpha_tau_log_summary(samples: np.ndarray, alpha_tau: float, valid_ratio: float) -> None:
-    if samples.size == 0:
-        print("[RSS][AlphaTau] No samples collected.")
-        return
-    pct = [1, 5, 10, 25, 50, 75, 90, 95, 99]
-    vals = np.percentile(samples, pct).astype(np.float32)
-    stats = " ".join([f"p{p:02d}={v:.4f}" for p, v in zip(pct, vals)])
-    print(
-        "[RSS][AlphaTau] sum_w stats: mean={:.4f} max={:.4f} {} | tau={:.4f} keep={:.2f}%".format(
-            float(samples.mean()),
-            float(samples.max()),
-            stats,
-            float(alpha_tau),
-            100.0 * float(valid_ratio),
-        )
+        {},
     )
 
 
@@ -699,17 +616,8 @@ def build_student_from_rss_voxel(
 
     cams = scene.getTrainCameras().copy()
     view_indices = _select_view_indices(cfg.num_views, len(cams))
-    alpha_samples = []
-    alpha_total = 0
-    alpha_valid = 0
-    per_view_alpha = 0
-    if cfg.log_alpha_tau and cfg.log_alpha_tau_samples > 0:
-        per_view_alpha = max(1, int(cfg.log_alpha_tau_samples // max(1, len(view_indices))))
-
     use_teacher_resample = cfg.center_mode == "teacher"
     teacher_xyz = None
-    tree = None
-    unique_teacher = None
 
     if use_teacher_resample:
         teacher_xyz = gaussians.get_xyz.detach().cpu().numpy()
@@ -748,21 +656,6 @@ def build_student_from_rss_voxel(
 
                 valid_px = sum_w > cfg.alpha_tau
                 num_valid += int(valid_px.sum().item())
-                if cfg.log_alpha_tau and per_view_alpha > 0:
-                    alpha_valid += int(valid_px.sum().item())
-                    if view.alpha_mask is not None:
-                        alpha_total += int(mask.sum().item())
-                        flat = sum_w[mask > 0].reshape(-1)
-                    else:
-                        alpha_total += int(sum_w.numel())
-                        flat = sum_w.reshape(-1)
-                    if flat.numel() > 0:
-                        take = min(per_view_alpha, int(flat.numel()))
-                        if flat.numel() > take:
-                            idx = torch.randint(0, flat.numel(), (take,), device=flat.device)
-                            flat = flat[idx]
-                        alpha_samples.append(flat.detach().cpu().numpy())
-
                 if valid_px.any():
                     tex_scale = None
                     if cfg.lambda_tex > 0:
@@ -829,20 +722,6 @@ def build_student_from_rss_voxel(
 
                 valid_px = sum_w > cfg.alpha_tau
                 num_valid += int(valid_px.sum().item())
-                if cfg.log_alpha_tau and per_view_alpha > 0:
-                    alpha_valid += int(valid_px.sum().item())
-                    if view.alpha_mask is not None:
-                        alpha_total += int(mask.sum().item())
-                        flat = sum_w[mask > 0].reshape(-1)
-                    else:
-                        alpha_total += int(sum_w.numel())
-                        flat = sum_w.reshape(-1)
-                    if flat.numel() > 0:
-                        take = min(per_view_alpha, int(flat.numel()))
-                        if flat.numel() > take:
-                            idx = torch.randint(0, flat.numel(), (take,), device=flat.device)
-                            flat = flat[idx]
-                        alpha_samples.append(flat.detach().cpu().numpy())
                 if not valid_px.any():
                     continue
 
@@ -902,11 +781,6 @@ def build_student_from_rss_voxel(
         else:
             raise ValueError(f"Unknown rss_mass_source: {cfg.mass_source}")
 
-        if cfg.log_alpha_tau and alpha_samples:
-            samples = np.concatenate(alpha_samples, axis=0)
-            valid_ratio = (alpha_valid / max(alpha_total, 1)) if alpha_total > 0 else 0.0
-            _alpha_tau_log_summary(samples, cfg.alpha_tau, valid_ratio)
-
         if mass.sum() <= 0:
             raise RuntimeError("Teacher-space resampling collected 0 mass across views.")
 
@@ -945,9 +819,6 @@ def build_student_from_rss_voxel(
         nn_idx = selected_ids
         dist = np.zeros_like(nn_idx, dtype=np.float32)
         timings["kdtree"] = 0.0
-        unique_teacher = centers.shape[0]
-        if cfg.debug and cKDTree is not None:
-            tree = cKDTree(teacher_xyz)
     else:
         points_list = []
         weights_list = []
@@ -970,22 +841,6 @@ def build_student_from_rss_voxel(
             else:
                 mask = None
 
-            if cfg.log_alpha_tau and per_view_alpha > 0:
-                valid_px = alpha > cfg.alpha_tau
-                alpha_valid += int(valid_px.sum().item())
-                if mask is not None:
-                    alpha_total += int(mask.sum().item())
-                    flat = alpha[mask > 0].reshape(-1)
-                else:
-                    alpha_total += int(alpha.numel())
-                    flat = alpha.reshape(-1)
-                if flat.numel() > 0:
-                    take = min(per_view_alpha, int(flat.numel()))
-                    if flat.numel() > take:
-                        idx = torch.randint(0, flat.numel(), (take,), device=flat.device)
-                        flat = flat[idx]
-                    alpha_samples.append(flat.detach().cpu().numpy())
-
             tex_grad = None
             if cfg.lambda_tex > 0:
                 tex_grad = _compute_texture_grad(view.original_image.to(alpha.device))
@@ -993,27 +848,14 @@ def build_student_from_rss_voxel(
                     tex_grad = tex_grad * view.alpha_mask[0].to(tex_grad.device)
 
             t0 = time.time()
-            debug_before = cfg.debug
-            if debug_before and "debug_done" in timings:
-                cfg.debug = False
-            pts, wts, debug_np = _sample_surface_points(view, alpha, depth_hit, depth_var, tex_grad, cfg)
-            cfg.debug = debug_before
+            pts, wts, _ = _sample_surface_points(view, alpha, depth_hit, depth_var, tex_grad, cfg)
             sample_time += time.time() - t0
 
             if pts.shape[0] == 0:
                 continue
             points_list.append(pts)
             weights_list.append(wts)
-            if cfg.debug and debug_np and "debug_done" not in timings:
-                _debug_reprojection(view, debug_np)
-                timings["debug_done"] = 1.0
-
         timings["render_sampling"] = render_time + sample_time
-        if cfg.log_alpha_tau and alpha_samples:
-            samples = np.concatenate(alpha_samples, axis=0)
-            valid_ratio = (alpha_valid / max(alpha_total, 1)) if alpha_total > 0 else 0.0
-            _alpha_tau_log_summary(samples, cfg.alpha_tau, valid_ratio)
-
         if not points_list:
             raise RuntimeError("RSS sampling collected 0 points across views.")
 
@@ -1093,8 +935,6 @@ def build_student_from_rss_voxel(
                     centers.shape[0],
                 )
             )
-            unique_teacher = np.unique(nn_idx).shape[0]
-            # Recompute NN distances after snapping for accurate debug.
             dist, nn_idx = tree.query(centers, k=1, workers=-1)
 
         if cfg.snap_unique:
@@ -1128,67 +968,12 @@ def build_student_from_rss_voxel(
                 nn_idx = nn_idx_kept
                 dist = dist_kept
 
-            unique_teacher = np.unique(nn_idx).shape[0]
             if centers.shape[0] < cfg.target_num_gaussians:
                 print(
                     f"[RSS] Snap unique: centers={centers.shape[0]} < target {cfg.target_num_gaussians}."
                 )
 
-        if cfg.debug:
-            print(
-                "[RSS][Debug] Center mode: {} voxel_size={:.6f} centers={}".format(
-                    cfg.center_mode,
-                    float(voxel_size),
-                    int(centers.shape[0]),
-                )
-            )
-            if cfg.center_mode == "teacher":
-                print(
-                    "[RSS][Debug] Teacher selector: {}".format(
-                        cfg.teacher_selector
-                    )
-                )
         dist = dist.astype(np.float32)
-        if dist.size > 0:
-            print(
-                "[RSS][Debug] NN distance centers->teacher: med={:.6f} p95={:.6f} max={:.6f}".format(
-                    float(np.median(dist)),
-                    float(np.percentile(dist, 95)),
-                    float(np.max(dist)),
-                )
-            )
-        if unique_teacher is not None:
-            print(
-                "[RSS][Debug] Unique teacher ids in centers: {} / {}".format(
-                    int(unique_teacher),
-                    int(centers.shape[0]),
-                )
-            )
-        if tree is None:
-            print("[RSS][Debug] KD-tree unavailable; skipping teacher distance stats.")
-        else:
-            sample_n = min(200000, teacher_xyz.shape[0])
-            sample_idx = np.random.choice(teacher_xyz.shape[0], size=sample_n, replace=False)
-            tdist, _ = tree.query(teacher_xyz[sample_idx], k=2, workers=-1)
-            if tdist.size > 0:
-                nn_dist = tdist[:, 1]
-                print(
-                    "[RSS][Debug] NN distance teacher->teacher: med={:.6f} p95={:.6f} max={:.6f}".format(
-                        float(np.median(nn_dist)),
-                        float(np.percentile(nn_dist, 95)),
-                        float(np.max(nn_dist)),
-                    )
-                )
-            tdist2, _ = tree.query(teacher_xyz, k=1, workers=-1)
-            if tdist2.size > 0:
-                print(
-                    "[RSS][Debug] Teacher->center coverage: med={:.6f} p95={:.6f} max={:.6f}".format(
-                        float(np.median(tdist2)),
-                        float(np.percentile(tdist2, 95)),
-                        float(np.max(tdist2)),
-                    )
-                )
-        print(f"[RSS][Debug] scene.cameras_extent={scene.cameras_extent:.6f}")
 
     device = gaussians.get_xyz.device
     dtype = gaussians.get_xyz.dtype
@@ -1225,47 +1010,6 @@ def build_student_from_rss_voxel(
         timings["scale_high_ratio"] = scale_high
         timings["opacity_low_ratio"] = op_low
         timings["opacity_high_ratio"] = op_high
-        if cfg.debug:
-            print(
-                "[RSS][Debug] Clamp ratios: scale_low={:.2f}% scale_high={:.2f}% "
-                "opacity_low={:.2f}% opacity_high={:.2f}%".format(
-                    100.0 * scale_low,
-                    100.0 * scale_high,
-                    100.0 * op_low,
-                    100.0 * op_high,
-                )
-            )
-            teach_op = gaussians.get_opacity.detach()
-            teach_scale = gaussians.get_scaling.detach()
-            print(
-                "[RSS][Debug] Teacher opacity: mean={:.4f} p05={:.4f} p95={:.4f}".format(
-                    float(teach_op.mean().item()),
-                    float(torch.quantile(teach_op, 0.05).item()),
-                    float(torch.quantile(teach_op, 0.95).item()),
-                )
-            )
-            print(
-                "[RSS][Debug] Student opacity: mean={:.4f} p05={:.4f} p95={:.4f}".format(
-                    float(clamped_opacity.mean().item()),
-                    float(torch.quantile(clamped_opacity, 0.05).item()),
-                    float(torch.quantile(clamped_opacity, 0.95).item()),
-                )
-            )
-            print(
-                "[RSS][Debug] Teacher scale: mean={:.4f} p05={:.4f} p95={:.4f}".format(
-                    float(teach_scale.mean().item()),
-                    float(torch.quantile(teach_scale, 0.05).item()),
-                    float(torch.quantile(teach_scale, 0.95).item()),
-                )
-            )
-            print(
-                "[RSS][Debug] Student scale: mean={:.4f} p05={:.4f} p95={:.4f}".format(
-                    float(clamped_scaling.mean().item()),
-                    float(torch.quantile(clamped_scaling, 0.05).item()),
-                    float(torch.quantile(clamped_scaling, 0.95).item()),
-                )
-            )
-
     timings["total"] = time.time() - start_total
     timings["voxel_size"] = float(voxel_size)
 

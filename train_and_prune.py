@@ -8,9 +8,6 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
-# from gaussian_splatting_sampler.utils import  RobustAutoSamplingTrigger
-# from gaussian_splatting_sampler.gmm_sampler import gaussian_model_reduction
-from gmm_sampler import gaussian_model_reduction
 import json
 import time
 import os
@@ -39,38 +36,6 @@ try:
 except:
     FUSED_SSIM_AVAILABLE = False
 
-try:
-    from diff_gaussian_rasterization import SparseGaussianAdam
-    SPARSE_ADAM_AVAILABLE = True
-except:
-    SPARSE_ADAM_AVAILABLE = False
-
-def _log_optimizer_state(optimizer, tag: str) -> None:
-    print(f"[RSS][Debug] Optimizer state ({tag})")
-    for group in optimizer.param_groups:
-        name = group.get("name", "unknown")
-        if not group["params"]:
-            print(f"[RSS][Debug]  {name}: no params")
-            continue
-        param = group["params"][0]
-        state = optimizer.state.get(param, None)
-        if not state or "exp_avg" not in state:
-            print(f"[RSS][Debug]  {name}: no exp_avg state")
-            continue
-        exp_avg = state["exp_avg"]
-        exp_avg_sq = state["exp_avg_sq"]
-        flat = exp_avg.view(-1)
-        step = max(1, flat.numel() // 200000)
-        sample = flat[::step]
-        mean_abs = float(sample.abs().mean().item())
-        max_abs = float(sample.abs().max().item())
-        flat2 = exp_avg_sq.view(-1)[::step]
-        mean_sq = float(flat2.mean().item())
-        print(
-            f"[RSS][Debug]  {name}: exp_avg_mean_abs={mean_abs:.6e} "
-            f"exp_avg_max_abs={max_abs:.6e} exp_avg_sq_mean={mean_sq:.6e}"
-        )
-
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, compaction=None):
     if compaction.flag:
         print('With Compaction!')
@@ -78,9 +43,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print('No Compaction!')
 
     start_time = time.time()
-    if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
-        sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
-
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
@@ -96,7 +58,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
-    use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
 
     viewpoint_stack = scene.getTrainCameras().copy()
@@ -152,7 +113,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=False)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         if viewpoint_cam.alpha_mask is not None:
@@ -253,10 +214,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             voxel_size=compaction.rss_voxel_size,
                             depth_gate=compaction.rss_depth_gate,
                             seed=compaction.rss_seed,
-                            debug=compaction.rss_debug,
-                            debug_samples=compaction.rss_debug_samples,
-                            log_alpha_tau=compaction.rss_log_alpha_tau,
-                            log_alpha_tau_samples=compaction.rss_log_alpha_tau_samples,
                             snap_to_teacher=compaction.rss_snap_to_teacher,
                             snap_factor=compaction.rss_snap_factor,
                             snap_min=compaction.rss_snap_min,
@@ -276,8 +233,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                 compaction.did_compact = True
                         else:
                             compaction.voxel_size = timings.get("voxel_size", None)
-                            if compaction.rss_debug:
-                                _log_optimizer_state(gaussians.optimizer, "pre_compaction")
                             xyz_tensors = gaussians.replace_tensor_to_optimizer(new_params["xyz"], "xyz")
                             gaussians._xyz = xyz_tensors["xyz"]
                             f_dc_tensors = gaussians.replace_tensor_to_optimizer(new_params["f_dc"], "f_dc")
@@ -330,10 +285,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                 compaction.did_compact = True
                             compaction.finetune_start = time.time()
                             skip_step = True
-                            if compaction.rss_debug:
-                                _log_optimizer_state(gaussians.optimizer, "post_compaction")
                     else:
-                        gaussians = subsampling(gaussians, compaction.ratio[index], 42, compaction.method)
+                        raise ValueError(f"Unsupported compaction method: {compaction.method}")
             if time_budget_sec > 0 and (time.time() - start_time) >= time_budget_sec:
                 if iteration not in saving_iterations:
                     print("\n[TimeBudget] Saving Gaussians at iter {}".format(iteration))
@@ -353,13 +306,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 else:
                     gaussians.exposure_optimizer.step()
                     gaussians.exposure_optimizer.zero_grad(set_to_none = True)
-                    if use_sparse_adam:
-                        visible = radii > 0
-                        gaussians.optimizer.step(visible, radii.shape[0])
-                        gaussians.optimizer.zero_grad(set_to_none = True)
-                    else:
-                        gaussians.optimizer.step()
-                        gaussians.optimizer.zero_grad(set_to_none = True)
+                    gaussians.optimizer.step()
+                    gaussians.optimizer.zero_grad(set_to_none = True)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
@@ -458,62 +406,6 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
 
-# TODO: For subsampling in training
-def subsampling(gaussians, ratio, random_seed=42, method='GMR'):
-    if method == 'GMR':
-        gaussian_ = gaussian_model_reduction(gaussians, ratio, random_seed)
-        xyz_tensors = gaussians.replace_tensor_to_optimizer(gaussian_._xyz, "xyz")
-        gaussians._xyz = xyz_tensors["xyz"]
-        f_dc_tensors = gaussians.replace_tensor_to_optimizer(gaussian_._features_dc, "f_dc")
-        gaussians._features_dc = f_dc_tensors["f_dc"]
-        f_rest_tensors = gaussians.replace_tensor_to_optimizer(gaussian_._features_rest, "f_rest")
-        gaussians._features_rest = f_rest_tensors["f_rest"]
-        scaling_tensors = gaussians.replace_tensor_to_optimizer(gaussian_._scaling, "scaling")
-        gaussians._scaling = scaling_tensors["scaling"]
-        rotation_tensors = gaussians.replace_tensor_to_optimizer(gaussian_._rotation, "rotation")
-        gaussians._rotation = rotation_tensors["rotation"]
-        opacity_tensors = gaussians.replace_tensor_to_optimizer(gaussian_._opacity, "opacity")
-        gaussians._opacity = opacity_tensors["opacity"]
-
-        gaussians.xyz_gradient_accum = torch.zeros((gaussian_.get_xyz.shape[0], 1), device="cuda")
-        gaussians.denom = torch.zeros((gaussian_.get_xyz.shape[0], 1), device="cuda")
-        gaussians.max_radii2D = torch.zeros((gaussian_.get_xyz.shape[0]), device="cuda")
-    elif method == 'random':
-        from torch import nn
-        import numpy as np
-        pass # TODO: write random part.
-        n = gaussians.get_xyz.shape[0]
-        downsample_num = int(n * ratio)
-        n_total = gaussians.get_xyz.shape[0]
-        assert downsample_num <= n_total
-        np.random.seed(random_seed)
-        keep_indices = np.random.choice(n_total, size=downsample_num, replace=False)
-        keep_indices = torch.from_numpy(keep_indices).to("cuda")
-        with torch.no_grad():
-            new_xyz = gaussians._xyz[keep_indices]
-            new_features_dc = gaussians._features_dc[keep_indices]
-            new_features_rest = gaussians._features_rest[keep_indices]
-            new_scaling = gaussians._scaling[keep_indices]
-            new_rotation = gaussians._rotation[keep_indices]
-            new_opacity = gaussians._opacity[keep_indices]
-            xyz_tensors = gaussians.replace_tensor_to_optimizer(new_xyz, "xyz")
-            gaussians._xyz = xyz_tensors["xyz"]
-            f_dc_tensors = gaussians.replace_tensor_to_optimizer(new_features_dc, "f_dc")
-            gaussians._features_dc = f_dc_tensors["f_dc"]
-            f_rest_tensors = gaussians.replace_tensor_to_optimizer(new_features_rest, "f_rest")
-            gaussians._features_rest = f_rest_tensors["f_rest"]
-            scaling_tensors = gaussians.replace_tensor_to_optimizer(new_scaling, "scaling")
-            gaussians._scaling = scaling_tensors["scaling"]
-            rotation_tensors = gaussians.replace_tensor_to_optimizer(new_rotation, "rotation")
-            gaussians._rotation = rotation_tensors["rotation"]
-            opacity_tensors = gaussians.replace_tensor_to_optimizer(new_opacity, "opacity")
-            gaussians._opacity = opacity_tensors["opacity"]
-            gaussians.xyz_gradient_accum = torch.zeros((new_xyz.shape[0], 1), device="cuda")
-            gaussians.denom = torch.zeros((new_xyz.shape[0], 1), device="cuda")
-            gaussians.max_radii2D = torch.zeros((new_xyz.shape[0]), device="cuda")
-    return gaussians
-
-
 if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
@@ -533,13 +425,11 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--sampling_iter", type=int, nargs='+', default=[15000])
     parser.add_argument("--sampling_ratio", type=float, nargs='+', default=[0.05])
-    parser.add_argument('--random', action='store_true', default=False)
-    parser.add_argument("--block_num", type=int, default=3000)
-    parser.add_argument("--compaction_method", type=str, default="ghap",
-                        choices=["ghap", "rss_voxel", "render_surface_resample"])
+    parser.add_argument("--compaction_method", type=str, default="rss_voxel",
+                        choices=["rss_voxel"])
     parser.add_argument("--target_num_gaussians", type=int, default=0)
-    parser.add_argument("--rss_num_views", type=int, default=300)
-    parser.add_argument("--rss_pixels_per_view", type=int, default=100_000)
+    parser.add_argument("--rss_num_views", type=int, default=0)
+    parser.add_argument("--rss_pixels_per_view", type=int, default=0)
     parser.add_argument("--rss_alpha_tau", type=float, default=0.05)
     parser.add_argument("--rss_lambda_tex", type=float, default=0.5)
     parser.add_argument("--rss_hit_quantile", type=float, default=0.7)
@@ -549,10 +439,6 @@ if __name__ == "__main__":
     parser.add_argument("--rss_mass_source", type=str, default="dominant", choices=["dominant", "opacity"])
     parser.add_argument("--rss_mass_topk", type=int, default=1)
     parser.add_argument("--rss_no_reset", action="store_true", default=False)
-    parser.add_argument("--rss_debug", action="store_true", default=False)
-    parser.add_argument("--rss_debug_samples", type=int, default=10000)
-    parser.add_argument("--rss_log_alpha_tau", action="store_true", default=False)
-    parser.add_argument("--rss_log_alpha_tau_samples", type=int, default=200000)
     parser.add_argument("--rss_snap_to_teacher", action="store_true", default=False)
     parser.add_argument("--rss_snap_factor", type=float, default=5.0)
     parser.add_argument("--rss_snap_min", type=float, default=0.0)
@@ -568,7 +454,7 @@ if __name__ == "__main__":
     args = parser.parse_args(sys.argv[1:])
     if args.iteration is not None:
         args.iterations = args.iteration
-    if args.compaction_method != "ghap":
+    if args.compaction_method == "rss_voxel":
         args.compact = True
     args.save_iterations.append(args.iterations)
 
@@ -582,7 +468,6 @@ if __name__ == "__main__":
             compact,
             sampling_iter,
             sampling_ratio,
-            random,
             compaction_method,
             target_num_gaussians,
             rss_num_views,
@@ -596,10 +481,6 @@ if __name__ == "__main__":
             rss_mass_source,
             rss_mass_topk,
             rss_no_reset,
-            rss_debug,
-            rss_debug_samples,
-            rss_log_alpha_tau,
-            rss_log_alpha_tau_samples,
             rss_snap_to_teacher,
             rss_snap_factor,
             rss_snap_min,
@@ -614,12 +495,9 @@ if __name__ == "__main__":
             self.flag = compact
             self.iter = sampling_iter
             self.ratio = sampling_ratio
-            if compaction_method == "render_surface_resample":
-                compaction_method = "rss_voxel"
-            if compaction_method == "rss_voxel":
-                self.method = "rss_voxel"
-            else:
-                self.method = "random" if random else "GMR"
+            if compaction_method != "rss_voxel":
+                raise ValueError(f"Unsupported compaction method: {compaction_method}")
+            self.method = "rss_voxel"
             self.target_num_gaussians = target_num_gaussians
             self.rss_num_views = rss_num_views
             self.rss_pixels_per_view = rss_pixels_per_view
@@ -632,10 +510,6 @@ if __name__ == "__main__":
             self.rss_mass_source = rss_mass_source
             self.rss_mass_topk = rss_mass_topk
             self.rss_no_reset = rss_no_reset
-            self.rss_debug = rss_debug
-            self.rss_debug_samples = rss_debug_samples
-            self.rss_log_alpha_tau = rss_log_alpha_tau
-            self.rss_log_alpha_tau_samples = rss_log_alpha_tau_samples
             self.rss_snap_to_teacher = rss_snap_to_teacher
             self.rss_snap_factor = rss_snap_factor
             self.rss_snap_min = rss_snap_min
@@ -652,7 +526,6 @@ if __name__ == "__main__":
         args.compact,
         args.sampling_iter,
         args.sampling_ratio,
-        args.random,
         args.compaction_method,
         args.target_num_gaussians,
         args.rss_num_views,
@@ -666,10 +539,6 @@ if __name__ == "__main__":
         args.rss_mass_source,
         args.rss_mass_topk,
         args.rss_no_reset,
-        args.rss_debug,
-        args.rss_debug_samples,
-        args.rss_log_alpha_tau,
-        args.rss_log_alpha_tau_samples,
         args.rss_snap_to_teacher,
         args.rss_snap_factor,
         args.rss_snap_min,
